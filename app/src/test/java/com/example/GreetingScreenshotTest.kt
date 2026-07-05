@@ -12,6 +12,11 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.GraphicsMode
 
+import androidx.work.Configuration
+import androidx.work.WorkManager
+import java.util.concurrent.Executors
+import org.junit.Before
+
 @RunWith(RobolectricTestRunner::class)
 @GraphicsMode(GraphicsMode.Mode.NATIVE)
 @Config(qualifiers = RobolectricDeviceQualifiers.Pixel8, sdk = [36])
@@ -19,9 +24,22 @@ class GreetingScreenshotTest {
 
   @get:Rule val composeTestRule = createComposeRule()
 
+  @Before
+  fun setUp() {
+    val context = androidx.test.core.app.ApplicationProvider.getApplicationContext<android.content.Context>()
+    try {
+      val config = Configuration.Builder()
+        .setExecutor(Executors.newSingleThreadExecutor())
+        .build()
+      WorkManager.initialize(context, config)
+    } catch (e: Exception) {
+      // Ignore if already initialized
+    }
+  }
+
   @Test
   fun greeting_screenshot() {
-    composeTestRule.setContent { MyApplicationTheme { Greeting("Robolectric") } }
+    composeTestRule.setContent { MyApplicationTheme { MainScreen() } }
 
     composeTestRule.onRoot().captureRoboImage(filePath = "src/test/screenshots/greeting.png")
   }

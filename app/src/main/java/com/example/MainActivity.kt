@@ -44,6 +44,12 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material.icons.filled.DarkMode
+import androidx.compose.material.icons.filled.LightMode
+import androidx.compose.material.icons.filled.BrightnessMedium
 import androidx.compose.material.icons.filled.Cancel
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Download
@@ -51,11 +57,20 @@ import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.Palette
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.VolumeUp
+import androidx.compose.material.icons.filled.VolumeOff
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.SdCard
 import androidx.compose.material.icons.filled.SmartDisplay
 import androidx.compose.material.icons.filled.StopCircle
 import androidx.compose.material.icons.filled.VideoLibrary
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Queue
+import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material.icons.filled.ClearAll
+import androidx.compose.material.icons.filled.HourglassEmpty
 import androidx.compose.material3.Button
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.ButtonDefaults
@@ -64,6 +79,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ProgressIndicatorDefaults
@@ -71,6 +87,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.material3.AlertDialog
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -79,6 +96,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -89,9 +107,12 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.work.ExistingWorkPolicy
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkInfo
@@ -103,14 +124,32 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileInputStream
+import android.content.SharedPreferences
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        val prefs = getSharedPreferences("app_theme_prefs", Context.MODE_PRIVATE)
         setContent {
-            MyApplicationTheme {
-                MainScreen()
+            val systemTheme = isSystemInDarkTheme()
+            var themeMode by remember {
+                mutableStateOf(prefs.getString("theme_mode", "system") ?: "system")
+            }
+            val isDarkTheme = when (themeMode) {
+                "dark" -> true
+                "light" -> false
+                else -> systemTheme
+            }
+            MyApplicationTheme(darkTheme = isDarkTheme) {
+                MainScreen(
+                    isDarkTheme = isDarkTheme,
+                    themeMode = themeMode,
+                    onThemeChange = { newMode ->
+                        themeMode = newMode
+                        prefs.edit().putString("theme_mode", newMode).apply()
+                    }
+                )
             }
         }
     }
@@ -118,18 +157,79 @@ class MainActivity : ComponentActivity() {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun MainScreen() {
+fun MainScreen(
+    isDarkTheme: Boolean = false,
+    themeMode: String = "system",
+    onThemeChange: (String) -> Unit = {}
+) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
     val workManager = remember { WorkManager.getInstance(context) }
 
     // Selected Video State
-    var selectedVideoUri by remember { mutableStateOf<Uri?>(null) }
-    var selectedVideoName by remember { mutableStateOf("No video selected") }
-    var selectedVideoSize by remember { mutableStateOf("") }
-    var selectedStyleMode by remember { mutableStateOf("cartoon") } // "cartoon" or "anime"
+    var videoQueue by remember { mutableStateOf(QueueManager.getQueue(context)) }
+    var activeComparisonVideo by remember { mutableStateOf<QueuedVideo?>(null) }
+    var selectedStyleMode by remember { mutableStateOf("pixar3d") } // "pixar3d", "cartoon", or "anime"
+    var selectedResolution by remember { mutableStateOf("480p") } // "360p", "480p", "720p", "1080p"
+    var selectedFps by remember { mutableStateOf(15) } // 10, 15, 24, 30
     var isCopyingToCache by remember { mutableStateOf(false) }
-    var renderedVideoUri by remember { mutableStateOf<Uri?>(null) }
+    var importProgressText by remember { mutableStateOf("") }
+
+    // Theme-aware Color Palettes
+    val cardBackground = if (isDarkTheme) Color(0xFF1D1B20) else Color.White
+    val cardBorderColor = if (isDarkTheme) Color(0xFF49454F) else Color(0xFFCAC4D0)
+    
+    val selectedContainerColor = if (isDarkTheme) Color(0xFF4F378B) else Color(0xFFE8DEF8)
+    val selectedContentColor = if (isDarkTheme) Color(0xFFE8DEF8) else Color(0xFF1D192B)
+    val selectedBorderColor = if (isDarkTheme) Color(0xFFD0BCFF) else Color(0xFF6750A4)
+    
+    val unselectedContainerColor = if (isDarkTheme) Color(0xFF1D1B20) else Color.White
+    val unselectedContentColor = if (isDarkTheme) Color(0xFFCAC4D0) else Color(0xFF49454F)
+    val unselectedSubtextColor = if (isDarkTheme) Color(0xFF938F99) else Color(0xFF79747E)
+    
+    val textPrimaryColor = if (isDarkTheme) Color(0xFFE6E1E5) else Color(0xFF1D1B20)
+    val textSecondaryColor = if (isDarkTheme) Color(0xFF938F99) else Color(0xFF79747E)
+
+    // SharedPreferences listener to observe queue in real time
+    DisposableEffect(context) {
+        val prefs = context.getSharedPreferences("video_queue_prefs", Context.MODE_PRIVATE)
+        val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+            if (key == "video_queue") {
+                videoQueue = QueueManager.getQueue(context)
+            }
+        }
+        prefs.registerOnSharedPreferenceChangeListener(listener)
+        onDispose {
+            prefs.unregisterOnSharedPreferenceChangeListener(listener)
+        }
+    }
+
+    fun resumeQueueProcessing(ctx: Context, wm: WorkManager) {
+        val queue = QueueManager.getQueue(ctx)
+        val hasActive = queue.any { it.status == "Processing" }
+        if (!hasActive) {
+            val nextPending = queue.firstOrNull { it.status == "Pending" }
+            if (nextPending != null) {
+                val inputData = workDataOf(
+                    VideoProcessorWorker.KEY_INPUT_URI to nextPending.originalUri,
+                    VideoProcessorWorker.KEY_STYLE_MODE to nextPending.styleMode,
+                    "queue_id" to nextPending.id,
+                    "target_resolution" to nextPending.targetResolution,
+                    "target_fps" to nextPending.targetFps
+                )
+                val workRequest = OneTimeWorkRequestBuilder<VideoProcessorWorker>()
+                    .setInputData(inputData)
+                    .addTag("video_cartoonize_job")
+                    .build()
+                wm.enqueueUniqueWork(
+                    "video_cartoonize_job",
+                    ExistingWorkPolicy.REPLACE,
+                    workRequest
+                )
+                QueueManager.updateVideoStatus(ctx, nextPending.id, "Processing", 0)
+            }
+        }
+    }
 
     // WorkManager status observer
     val workInfos by workManager.getWorkInfosForUniqueWorkFlow("video_cartoonize_job")
@@ -141,33 +241,52 @@ fun MainScreen() {
         activeWorkInfo.state == WorkInfo.State.ENQUEUED ||
         activeWorkInfo.state == WorkInfo.State.BLOCKED
     )
-    val isSucceeded = activeWorkInfo?.state == WorkInfo.State.SUCCEEDED
-    val isFailed = activeWorkInfo?.state == WorkInfo.State.FAILED
 
-    val progressValue = activeWorkInfo?.progress?.getInt(VideoProcessorWorker.KEY_PROGRESS, 0) ?: 0
-    val statusText = if (activeWorkInfo?.state == WorkInfo.State.ENQUEUED) {
-        "Queued for processing..."
-    } else {
-        activeWorkInfo?.progress?.getString(VideoProcessorWorker.KEY_STATUS) ?: "Standby"
-    }
-    val outputPath = activeWorkInfo?.outputData?.getString(VideoProcessorWorker.KEY_OUTPUT_PATH)
-    val errorMessage = activeWorkInfo?.outputData?.getString(VideoProcessorWorker.KEY_ERROR)
-    val showProgressAndOutput = selectedVideoUri != null && selectedVideoUri == renderedVideoUri
+    // Sync WorkManager statuses with queue items
+    LaunchedEffect(workInfos) {
+        val activeWork = workInfos.firstOrNull()
+        val isRunning = activeWork != null && (
+            activeWork.state == WorkInfo.State.RUNNING ||
+            activeWork.state == WorkInfo.State.ENQUEUED ||
+            activeWork.state == WorkInfo.State.BLOCKED
+        )
 
-    // Sync renderedVideoUri from activeWorkInfo progress or output to restore state automatically
-    LaunchedEffect(activeWorkInfo) {
-        if (activeWorkInfo != null) {
-            val progressUri = activeWorkInfo.progress.getString(VideoProcessorWorker.KEY_INPUT_URI)
-            val outputUri = activeWorkInfo.outputData.getString(VideoProcessorWorker.KEY_INPUT_URI)
-            val uriStr = progressUri ?: outputUri
-            if (uriStr != null) {
-                val recoveredUri = Uri.parse(uriStr)
-                if (selectedVideoUri == null) {
-                    selectedVideoUri = recoveredUri
-                    renderedVideoUri = recoveredUri
-                    selectedVideoName = "Recovered Video"
-                } else if (renderedVideoUri == null) {
-                    renderedVideoUri = recoveredUri
+        if (!isRunning) {
+            val queue = QueueManager.getQueue(context)
+            var changed = false
+            queue.forEach { video ->
+                if (video.status == "Processing") {
+                    QueueManager.updateVideoStatus(context, video.id, "Pending", 0)
+                    changed = true
+                }
+            }
+            if (changed) {
+                resumeQueueProcessing(context, workManager)
+            }
+        } else {
+            activeWork?.let { work ->
+                val progress = work.progress.getInt(VideoProcessorWorker.KEY_PROGRESS, -1)
+                val queueId = work.progress.getString("queue_id") ?: work.outputData.getString("queue_id")
+                
+                if (queueId != null) {
+                    val targetVideo = QueueManager.getQueue(context).find { it.id == queueId }
+                    if (targetVideo != null) {
+                        if (work.state == WorkInfo.State.SUCCEEDED) {
+                            val outPath = work.outputData.getString(VideoProcessorWorker.KEY_OUTPUT_PATH)
+                            if (targetVideo.status != "Completed" && outPath != null) {
+                                QueueManager.updateVideoStatus(context, queueId, "Completed", 100, outputPath = outPath)
+                                resumeQueueProcessing(context, workManager)
+                            }
+                        } else if (work.state == WorkInfo.State.FAILED) {
+                            val err = work.outputData.getString(VideoProcessorWorker.KEY_ERROR) ?: "Pipeline error"
+                            if (targetVideo.status != "Failed") {
+                                QueueManager.updateVideoStatus(context, queueId, "Failed", errorMessage = err)
+                                resumeQueueProcessing(context, workManager)
+                            }
+                        } else if (progress >= 0) {
+                            QueueManager.updateVideoStatus(context, queueId, "Processing", progress)
+                        }
+                    }
                 }
             }
         }
@@ -175,24 +294,35 @@ fun MainScreen() {
 
     // Gallery Video Picker
     val pickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.PickVisualMedia()
-    ) { uri ->
-        if (uri != null) {
+        contract = ActivityResultContracts.PickMultipleVisualMedia()
+    ) { uris ->
+        if (uris.isNotEmpty()) {
             isCopyingToCache = true
-            selectedVideoName = "Importing video..."
-            selectedVideoSize = ""
             coroutineScope.launch(Dispatchers.IO) {
-                val cachedFile = copyUriToCache(context, uri)
+                uris.forEachIndexed { index, uri ->
+                    withContext(Dispatchers.Main) {
+                        importProgressText = "Copying video ${index + 1} of ${uris.size}..."
+                    }
+                    val cachedFile = copyUriToCache(context, uri)
+                    if (cachedFile != null) {
+                        val name = getFileName(context, uri) ?: "Selected Video"
+                        val size = getFileSizeString(context, uri) ?: ""
+                        val newVideo = QueuedVideo(
+                            id = System.currentTimeMillis().toString() + "_" + (100..999).random(),
+                            originalUri = Uri.fromFile(cachedFile).toString(),
+                            name = name,
+                            size = size,
+                            styleMode = selectedStyleMode,
+                            status = "Pending",
+                            targetResolution = selectedResolution,
+                            targetFps = selectedFps
+                        )
+                        QueueManager.addToQueue(context, newVideo)
+                    }
+                }
                 withContext(Dispatchers.Main) {
                     isCopyingToCache = false
-                    if (cachedFile != null) {
-                        selectedVideoUri = Uri.fromFile(cachedFile)
-                        selectedVideoName = getFileName(context, uri) ?: "Selected Video"
-                        selectedVideoSize = getFileSizeString(context, uri) ?: ""
-                    } else {
-                        selectedVideoName = "Failed to load video"
-                        Toast.makeText(context, "Failed to import video. Try another file.", Toast.LENGTH_LONG).show()
-                    }
+                    resumeQueueProcessing(context, workManager)
                 }
             }
         }
@@ -222,19 +352,90 @@ fun MainScreen() {
                                 color = MaterialTheme.colorScheme.onBackground
                             )
                         }
-                        // AI indicator badge
-                        Box(
-                            modifier = Modifier
-                                .clip(CircleShape)
-                                .background(Color(0xFFE8DEF8))
-                                .padding(horizontal = 10.dp, vertical = 4.dp)
+                        // Theme toggle and AI indicator badge row
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            Text(
-                                text = "AI",
-                                color = Color(0xFF1D192B),
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 11.sp
-                            )
+                            var showThemeMenu by remember { mutableStateOf(false) }
+                            Box {
+                                IconButton(
+                                    onClick = { showThemeMenu = true },
+                                    modifier = Modifier.testTag("theme_toggle_button")
+                                ) {
+                                    Icon(
+                                        imageVector = when (themeMode) {
+                                            "light" -> Icons.Default.LightMode
+                                            "dark" -> Icons.Default.DarkMode
+                                            else -> Icons.Default.BrightnessMedium
+                                        },
+                                        contentDescription = "Change Theme",
+                                        tint = MaterialTheme.colorScheme.primary
+                                    )
+                                }
+                                DropdownMenu(
+                                    expanded = showThemeMenu,
+                                    onDismissRequest = { showThemeMenu = false }
+                                ) {
+                                    DropdownMenuItem(
+                                        text = { Text("Light Theme") },
+                                        onClick = {
+                                            onThemeChange("light")
+                                            showThemeMenu = false
+                                        },
+                                        leadingIcon = {
+                                            Icon(
+                                                imageVector = Icons.Default.LightMode,
+                                                contentDescription = null
+                                            )
+                                        },
+                                        modifier = Modifier.testTag("theme_option_light")
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("Dark Theme") },
+                                        onClick = {
+                                            onThemeChange("dark")
+                                            showThemeMenu = false
+                                        },
+                                        leadingIcon = {
+                                            Icon(
+                                                imageVector = Icons.Default.DarkMode,
+                                                contentDescription = null
+                                            )
+                                        },
+                                        modifier = Modifier.testTag("theme_option_dark")
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("System Default") },
+                                        onClick = {
+                                            onThemeChange("system")
+                                            showThemeMenu = false
+                                        },
+                                        leadingIcon = {
+                                            Icon(
+                                                imageVector = Icons.Default.BrightnessMedium,
+                                                contentDescription = null
+                                            )
+                                        },
+                                        modifier = Modifier.testTag("theme_option_system")
+                                    )
+                                }
+                            }
+
+                            // AI indicator badge
+                            Box(
+                                modifier = Modifier
+                                    .clip(CircleShape)
+                                    .background(MaterialTheme.colorScheme.primaryContainer)
+                                    .padding(horizontal = 10.dp, vertical = 4.dp)
+                            ) {
+                                Text(
+                                    text = "AI",
+                                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 11.sp
+                                )
+                            }
                         }
                     }
                 },
@@ -317,7 +518,11 @@ fun MainScreen() {
                             )
                             Spacer(modifier = Modifier.height(4.dp))
                             Text(
-                                text = if (selectedStyleMode == "anime") "AI ANIME" else "AI CARTOON",
+                                text = when (selectedStyleMode) {
+                                    "anime" -> "AI ANIME"
+                                    "pixar3d" -> "AI 3D PIXAR"
+                                    else -> "AI CARTOON"
+                                },
                                 color = Color(0xFFD0BCFF),
                                 fontSize = 10.sp,
                                 fontWeight = FontWeight.Bold,
@@ -402,6 +607,7 @@ fun MainScreen() {
             Spacer(modifier = Modifier.height(20.dp))
 
             // Step 1 Card: Select Video Source (Vibrant Palette Theme)
+            // Step 1 Card: Select Video Source (Vibrant Palette Theme)
             Card(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -422,13 +628,13 @@ fun MainScreen() {
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Icon(
-                            imageVector = Icons.Default.Movie,
+                            imageVector = Icons.Default.VideoLibrary,
                             contentDescription = "Video Source",
                             tint = Color(0xFF6750A4)
                         )
                         Spacer(modifier = Modifier.width(10.dp))
                         Text(
-                            text = "1. CHOOSE SOURCE VIDEO",
+                            text = "1. CHOOSE SOURCE VIDEOS",
                             color = Color(0xFF1D1B20),
                             fontWeight = FontWeight.Bold,
                             fontSize = 14.sp,
@@ -444,9 +650,9 @@ fun MainScreen() {
                             .fillMaxWidth()
                             .height(110.dp)
                             .clip(RoundedCornerShape(16.dp))
-                            .background(Color.White)
-                            .border(1.dp, Color(0xFFCAC4D0), RoundedCornerShape(16.dp))
-                            .clickable(enabled = !isProcessing && !isCopyingToCache) {
+                            .background(cardBackground)
+                            .border(1.dp, cardBorderColor, RoundedCornerShape(16.dp))
+                            .clickable(enabled = !isCopyingToCache) {
                                 pickerLauncher.launch(
                                     PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoOnly)
                                 )
@@ -458,67 +664,37 @@ fun MainScreen() {
                             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                                 CircularProgressIndicator(
                                     modifier = Modifier.size(24.dp),
-                                    color = Color(0xFF6750A4)
+                                    color = MaterialTheme.colorScheme.primary
                                 )
                                 Spacer(modifier = Modifier.height(8.dp))
                                 Text(
-                                    text = "Importing and copying video to safe cache...",
-                                    color = Color(0xFF49454F),
+                                    text = importProgressText.ifEmpty { "Importing selected videos..." },
+                                    color = textSecondaryColor,
                                     fontSize = 12.sp,
                                     fontWeight = FontWeight.Medium
                                 )
                             }
-                        } else if (selectedVideoUri == null) {
-                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        } else {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(16.dp)) {
                                 Icon(
-                                    imageVector = Icons.Default.VideoLibrary,
+                                    imageVector = Icons.Default.Queue,
                                     contentDescription = "Import video icon",
-                                    tint = Color(0xFF6750A4),
+                                    tint = MaterialTheme.colorScheme.primary,
                                     modifier = Modifier.size(32.dp)
                                 )
                                 Spacer(modifier = Modifier.height(6.dp))
                                 Text(
-                                    text = "Tap to choose video from gallery",
-                                    color = Color(0xFF49454F),
+                                    text = "SELECT VIDEOS TO CARTOONIZE",
+                                    color = MaterialTheme.colorScheme.primary,
                                     fontSize = 13.sp,
-                                    fontWeight = FontWeight.SemiBold
+                                    fontWeight = FontWeight.Bold
                                 )
-                            }
-                        } else {
-                            Column(
-                                modifier = Modifier.padding(12.dp),
-                                horizontalAlignment = Alignment.CenterHorizontally
-                            ) {
+                                Spacer(modifier = Modifier.height(2.dp))
                                 Text(
-                                    text = selectedVideoName,
-                                    color = Color(0xFF6750A4),
-                                    fontWeight = FontWeight.Bold,
-                                    fontSize = 14.sp,
-                                    textAlign = TextAlign.Center,
-                                    maxLines = 1
-                                )
-                                Spacer(modifier = Modifier.height(4.dp))
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Icon(
-                                        imageVector = Icons.Default.SdCard,
-                                        contentDescription = "Size",
-                                        tint = Color(0xFF79747E),
-                                        modifier = Modifier.size(14.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    Text(
-                                        text = selectedVideoSize,
-                                        color = Color(0xFF79747E),
-                                        fontSize = 12.sp
-                                    )
-                                }
-                                Spacer(modifier = Modifier.height(6.dp))
-                                Text(
-                                    text = "Tap to change video",
-                                    color = Color(0xFFFF007F),
+                                    text = "Multiple selection supported. Will process in style selected below.",
+                                    color = textSecondaryColor,
                                     fontSize = 11.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    fontFamily = FontFamily.Monospace
+                                    textAlign = TextAlign.Center
                                 )
                             }
                         }
@@ -529,25 +705,32 @@ fun MainScreen() {
                     OutlinedButton(
                         onClick = {
                             isCopyingToCache = true
-                            selectedVideoName = "Preparing sample video..."
-                            selectedVideoSize = ""
+                            importProgressText = "Preparing sample video..."
                             coroutineScope.launch(Dispatchers.IO) {
                                 val cachedFile = copyAssetToCache(context, "sample.mp4")
                                 withContext(Dispatchers.Main) {
                                     isCopyingToCache = false
                                     if (cachedFile != null) {
-                                        selectedVideoUri = Uri.fromFile(cachedFile)
-                                        selectedVideoName = "sample.mp4 (Offline Demo)"
-                                        selectedVideoSize = "770 KB"
-                                        Toast.makeText(context, "Offline sample video loaded successfully!", Toast.LENGTH_SHORT).show()
+                                        val newVideo = QueuedVideo(
+                                            id = System.currentTimeMillis().toString() + "_" + (100..999).random(),
+                                            originalUri = Uri.fromFile(cachedFile).toString(),
+                                            name = "sample.mp4 (Offline Demo)",
+                                            size = "770 KB",
+                                            styleMode = selectedStyleMode,
+                                            status = "Pending",
+                                            targetResolution = selectedResolution,
+                                            targetFps = selectedFps
+                                        )
+                                        QueueManager.addToQueue(context, newVideo)
+                                        resumeQueueProcessing(context, workManager)
+                                        Toast.makeText(context, "Sample video added to queue!", Toast.LENGTH_SHORT).show()
                                     } else {
-                                        selectedVideoName = "Failed to load sample video"
-                                        Toast.makeText(context, "Failed to load sample video from assets.", Toast.LENGTH_LONG).show()
+                                        Toast.makeText(context, "Failed to load sample video.", Toast.LENGTH_LONG).show()
                                     }
                                 }
                             }
                         },
-                        enabled = !isProcessing && !isCopyingToCache,
+                        enabled = !isCopyingToCache,
                         shape = CircleShape,
                         colors = ButtonDefaults.outlinedButtonColors(
                             contentColor = Color(0xFF6750A4)
@@ -585,14 +768,14 @@ fun MainScreen() {
                 Box(
                     modifier = Modifier
                         .weight(1f)
-                        .background(Color.White, RoundedCornerShape(16.dp))
-                        .border(1.dp, Color(0xFFCAC4D0), RoundedCornerShape(16.dp))
+                        .background(cardBackground, RoundedCornerShape(16.dp))
+                        .border(1.dp, cardBorderColor, RoundedCornerShape(16.dp))
                         .padding(12.dp)
                 ) {
                     Column {
                         Text(
                             text = "MEMORY USAGE",
-                            color = Color(0xFF79747E),
+                            color = textSecondaryColor,
                             fontWeight = FontWeight.Bold,
                             fontSize = 10.sp,
                             letterSpacing = 0.5.sp
@@ -600,7 +783,7 @@ fun MainScreen() {
                         Spacer(modifier = Modifier.height(4.dp))
                         Text(
                             text = if (isProcessing) "184MB / 1.2GB Pool" else "32MB Idle",
-                            color = Color(0xFF1D1B20),
+                            color = textPrimaryColor,
                             fontSize = 13.sp,
                             fontWeight = FontWeight.Medium
                         )
@@ -611,14 +794,14 @@ fun MainScreen() {
                 Box(
                     modifier = Modifier
                         .weight(1f)
-                        .background(Color.White, RoundedCornerShape(16.dp))
-                        .border(1.dp, Color(0xFFCAC4D0), RoundedCornerShape(16.dp))
+                        .background(cardBackground, RoundedCornerShape(16.dp))
+                        .border(1.dp, cardBorderColor, RoundedCornerShape(16.dp))
                         .padding(12.dp)
                 ) {
                     Column {
                         Text(
                             text = "WORKER STATUS",
-                            color = Color(0xFF79747E),
+                            color = textSecondaryColor,
                             fontWeight = FontWeight.Bold,
                             fontSize = 10.sp,
                             letterSpacing = 0.5.sp
@@ -634,7 +817,7 @@ fun MainScreen() {
                             Spacer(modifier = Modifier.width(6.dp))
                             Text(
                                 text = if (isProcessing) "Active Foreground" else "Service Standby",
-                                color = Color(0xFF1D1B20),
+                                color = textPrimaryColor,
                                 fontSize = 13.sp,
                                 fontWeight = FontWeight.Medium
                             )
@@ -651,11 +834,11 @@ fun MainScreen() {
                     .fillMaxWidth()
                     .border(
                         width = 1.dp,
-                        color = Color(0xFFCAC4D0),
+                        color = cardBorderColor,
                         shape = RoundedCornerShape(28.dp)
                     ),
                 shape = RoundedCornerShape(28.dp),
-                colors = CardDefaults.cardColors(containerColor = Color(0xFFF3EDF7))
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
             ) {
                 Column(modifier = Modifier.padding(20.dp)) {
                     Text(
@@ -671,7 +854,7 @@ fun MainScreen() {
 
                     Text(
                         text = "SELECT STYLIZATION STYLE",
-                        color = Color(0xFF79747E),
+                        color = textSecondaryColor,
                         fontWeight = FontWeight.Bold,
                         fontSize = 10.sp,
                         letterSpacing = 0.5.sp
@@ -680,42 +863,82 @@ fun MainScreen() {
 
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
+                        // 3D Pixar Option Card
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(if (selectedStyleMode == "pixar3d") selectedContainerColor else unselectedContainerColor)
+                                .border(
+                                    width = if (selectedStyleMode == "pixar3d") 2.dp else 1.dp,
+                                    color = if (selectedStyleMode == "pixar3d") selectedBorderColor else cardBorderColor,
+                                    shape = RoundedCornerShape(12.dp)
+                                )
+                                .clickable(enabled = !isProcessing) { selectedStyleMode = "pixar3d" }
+                                .padding(8.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Icon(
+                                    imageVector = Icons.Default.Movie,
+                                    contentDescription = "3D Pixar mode",
+                                    tint = if (selectedStyleMode == "pixar3d") selectedBorderColor else unselectedContentColor,
+                                    modifier = Modifier.size(22.dp)
+                                )
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    text = "3D Pixar",
+                                    color = if (selectedStyleMode == "pixar3d") selectedContentColor else unselectedContentColor,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 11.sp
+                                )
+                                Text(
+                                    text = "Smooth 3D look",
+                                    color = if (selectedStyleMode == "pixar3d") selectedContentColor.copy(alpha = 0.7f) else unselectedSubtextColor,
+                                    fontSize = 9.sp,
+                                    textAlign = TextAlign.Center,
+                                    lineHeight = 11.sp
+                                )
+                            }
+                        }
+
                         // Cartoon Option Card
                         Box(
                             modifier = Modifier
                                 .weight(1f)
-                                .clip(RoundedCornerShape(16.dp))
-                                .background(if (selectedStyleMode == "cartoon") Color(0xFFE8DEF8) else Color.White)
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(if (selectedStyleMode == "cartoon") selectedContainerColor else unselectedContainerColor)
                                 .border(
                                     width = if (selectedStyleMode == "cartoon") 2.dp else 1.dp,
-                                    color = if (selectedStyleMode == "cartoon") Color(0xFF6750A4) else Color(0xFFCAC4D0),
-                                    shape = RoundedCornerShape(16.dp)
+                                    color = if (selectedStyleMode == "cartoon") selectedBorderColor else cardBorderColor,
+                                    shape = RoundedCornerShape(12.dp)
                                 )
                                 .clickable(enabled = !isProcessing) { selectedStyleMode = "cartoon" }
-                                .padding(12.dp),
+                                .padding(8.dp),
                             contentAlignment = Alignment.Center
                         ) {
                             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                                 Icon(
                                     imageVector = Icons.Default.Palette,
                                     contentDescription = "Cartoon mode",
-                                    tint = if (selectedStyleMode == "cartoon") Color(0xFF6750A4) else Color(0xFF49454F),
-                                    modifier = Modifier.size(24.dp)
+                                    tint = if (selectedStyleMode == "cartoon") selectedBorderColor else unselectedContentColor,
+                                    modifier = Modifier.size(22.dp)
                                 )
                                 Spacer(modifier = Modifier.height(4.dp))
                                 Text(
-                                    text = "Classic Cartoon",
-                                    color = if (selectedStyleMode == "cartoon") Color(0xFF1D192B) else Color(0xFF49454F),
+                                    text = "Cartoon",
+                                    color = if (selectedStyleMode == "cartoon") selectedContentColor else unselectedContentColor,
                                     fontWeight = FontWeight.Bold,
-                                    fontSize = 13.sp
+                                    fontSize = 11.sp
                                 )
                                 Text(
-                                    text = "Edge lines & shading",
-                                    color = if (selectedStyleMode == "cartoon") Color(0xFF1D192B).copy(alpha = 0.7f) else Color(0xFF79747E),
-                                    fontSize = 10.sp,
-                                    textAlign = TextAlign.Center
+                                    text = "Classic outline",
+                                    color = if (selectedStyleMode == "cartoon") selectedContentColor.copy(alpha = 0.7f) else unselectedSubtextColor,
+                                    fontSize = 9.sp,
+                                    textAlign = TextAlign.Center,
+                                    lineHeight = 11.sp
                                 )
                             }
                         }
@@ -724,36 +947,37 @@ fun MainScreen() {
                         Box(
                             modifier = Modifier
                                 .weight(1f)
-                                .clip(RoundedCornerShape(16.dp))
-                                .background(if (selectedStyleMode == "anime") Color(0xFFE8DEF8) else Color.White)
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(if (selectedStyleMode == "anime") selectedContainerColor else unselectedContainerColor)
                                 .border(
                                     width = if (selectedStyleMode == "anime") 2.dp else 1.dp,
-                                    color = if (selectedStyleMode == "anime") Color(0xFF6750A4) else Color(0xFFCAC4D0),
-                                    shape = RoundedCornerShape(16.dp)
+                                    color = if (selectedStyleMode == "anime") selectedBorderColor else cardBorderColor,
+                                    shape = RoundedCornerShape(12.dp)
                                 )
                                 .clickable(enabled = !isProcessing) { selectedStyleMode = "anime" }
-                                .padding(12.dp),
+                                .padding(8.dp),
                             contentAlignment = Alignment.Center
                         ) {
                             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                                 Icon(
                                     imageVector = Icons.Default.AutoAwesome,
                                     contentDescription = "Anime mode",
-                                    tint = if (selectedStyleMode == "anime") Color(0xFF6750A4) else Color(0xFF49454F),
-                                    modifier = Modifier.size(24.dp)
+                                    tint = if (selectedStyleMode == "anime") selectedBorderColor else unselectedContentColor,
+                                    modifier = Modifier.size(22.dp)
                                 )
                                 Spacer(modifier = Modifier.height(4.dp))
                                 Text(
-                                    text = "Vibrant Anime",
-                                    color = if (selectedStyleMode == "anime") Color(0xFF1D192B) else Color(0xFF49454F),
+                                    text = "Anime",
+                                    color = if (selectedStyleMode == "anime") selectedContentColor else unselectedContentColor,
                                     fontWeight = FontWeight.Bold,
-                                    fontSize = 13.sp
+                                    fontSize = 11.sp
                                 )
                                 Text(
-                                    text = "Soft bloom, rich color",
-                                    color = if (selectedStyleMode == "anime") Color(0xFF1D192B).copy(alpha = 0.7f) else Color(0xFF79747E),
-                                    fontSize = 10.sp,
-                                    textAlign = TextAlign.Center
+                                    text = "Vibrant glow",
+                                    color = if (selectedStyleMode == "anime") selectedContentColor.copy(alpha = 0.7f) else unselectedSubtextColor,
+                                    fontSize = 9.sp,
+                                    textAlign = TextAlign.Center,
+                                    lineHeight = 11.sp
                                 )
                             }
                         }
@@ -761,13 +985,137 @@ fun MainScreen() {
 
                     Spacer(modifier = Modifier.height(16.dp))
 
-                    if (showProgressAndOutput && (isProcessing || progressValue > 0)) {
+                    Text(
+                        text = "EXPORT CONFIGURATION",
+                        color = textSecondaryColor,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 10.sp,
+                        letterSpacing = 0.5.sp
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    // Resolution Section
+                    Text(
+                        text = "Output Resolution",
+                        color = textPrimaryColor,
+                        fontWeight = FontWeight.Medium,
+                        fontSize = 12.sp
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        val resolutions = listOf("360p", "480p", "720p", "1080p")
+                        resolutions.forEach { res ->
+                            val isSelected = selectedResolution == res
+                            Box(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(if (isSelected) selectedContainerColor else unselectedContainerColor)
+                                    .border(
+                                        width = if (isSelected) 2.dp else 1.dp,
+                                        color = if (isSelected) selectedBorderColor else cardBorderColor,
+                                        shape = RoundedCornerShape(8.dp)
+                                    )
+                                    .clickable(enabled = !isProcessing) { selectedResolution = res }
+                                    .testTag("resolution_$res")
+                                    .padding(vertical = 10.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                    Text(
+                                        text = res,
+                                        color = if (isSelected) selectedContentColor else unselectedContentColor,
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 12.sp
+                                    )
+                                    Text(
+                                        text = when (res) {
+                                            "360p" -> "Fast"
+                                            "480p" -> "Balanced"
+                                            "720p" -> "High-Def"
+                                            "1080p" -> "Full-Def"
+                                            else -> ""
+                                        },
+                                        color = if (isSelected) selectedContentColor.copy(alpha = 0.7f) else unselectedSubtextColor,
+                                        fontSize = 8.sp
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    // Frame Rate Section
+                    Text(
+                        text = "Frame Rate (FPS)",
+                        color = textPrimaryColor,
+                        fontWeight = FontWeight.Medium,
+                        fontSize = 12.sp
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        val fpsOptions = listOf(10, 15, 24, 30)
+                        fpsOptions.forEach { fpsVal ->
+                            val isSelected = selectedFps == fpsVal
+                            Box(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(if (isSelected) selectedContainerColor else unselectedContainerColor)
+                                    .border(
+                                        width = if (isSelected) 2.dp else 1.dp,
+                                        color = if (isSelected) selectedBorderColor else cardBorderColor,
+                                        shape = RoundedCornerShape(8.dp)
+                                    )
+                                    .clickable(enabled = !isProcessing) { selectedFps = fpsVal }
+                                    .testTag("fps_$fpsVal")
+                                    .padding(vertical = 10.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                    Text(
+                                        text = "$fpsVal FPS",
+                                        color = if (isSelected) selectedContentColor else unselectedContentColor,
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 12.sp
+                                    )
+                                    Text(
+                                        text = when (fpsVal) {
+                                            10 -> "Draft"
+                                            15 -> "Default"
+                                            24 -> "Cinema"
+                                            30 -> "Fluid"
+                                            else -> ""
+                                        },
+                                        color = if (isSelected) selectedContentColor.copy(alpha = 0.7f) else unselectedSubtextColor,
+                                        fontSize = 8.sp
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    val activeProcessingVideo = videoQueue.find { it.status == "Processing" }
+
+                    if (activeProcessingVideo != null) {
+                        val progressPct = activeProcessingVideo.progress
                         // Detailed Mockup processing panel styled inside a beautiful nested Card
                         Card(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .padding(vertical = 4.dp),
-                            colors = CardDefaults.cardColors(containerColor = Color.White),
+                            colors = CardDefaults.cardColors(containerColor = cardBackground),
                             shape = RoundedCornerShape(20.dp),
                             elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
                         ) {
@@ -783,15 +1131,15 @@ fun MainScreen() {
                                         modifier = Modifier.size(72.dp)
                                     ) {
                                         CircularProgressIndicator(
-                                            progress = { progressValue / 100f },
+                                            progress = { progressPct / 100f },
                                             modifier = Modifier.fillMaxSize(),
-                                            color = Color(0xFF6750A4),
+                                            color = MaterialTheme.colorScheme.primary,
                                             strokeWidth = 6.dp,
-                                            trackColor = Color(0xFFE6E1E5)
+                                            trackColor = MaterialTheme.colorScheme.surfaceVariant
                                         )
                                         Text(
-                                            text = "$progressValue%",
-                                            color = Color(0xFF6750A4),
+                                            text = "$progressPct%",
+                                            color = MaterialTheme.colorScheme.primary,
                                             fontWeight = FontWeight.ExtraBold,
                                             fontSize = 14.sp,
                                             fontFamily = FontFamily.Monospace
@@ -800,15 +1148,17 @@ fun MainScreen() {
 
                                     Column(modifier = Modifier.weight(1f)) {
                                         Text(
-                                            text = if (selectedStyleMode == "anime") "Vibrant Anime Stylization" else "Classic Cartoon Stylization",
+                                            text = activeProcessingVideo.name,
                                             fontWeight = FontWeight.Bold,
-                                            color = Color(0xFF1D1B20),
-                                            fontSize = 15.sp
+                                            color = textPrimaryColor,
+                                            fontSize = 14.sp,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
                                         )
                                         Spacer(modifier = Modifier.height(2.dp))
                                         Text(
-                                            text = "Engine: AnimeGANv2 TFLite",
-                                            color = Color(0xFF79747E),
+                                            text = "Style: ${activeProcessingVideo.styleMode.uppercase()}",
+                                            color = textSecondaryColor,
                                             fontSize = 11.sp,
                                             fontWeight = FontWeight.Medium
                                         )
@@ -817,12 +1167,12 @@ fun MainScreen() {
                                         Box(
                                             modifier = Modifier
                                                 .clip(RoundedCornerShape(8.dp))
-                                                .background(Color(0xFFE8DEF8))
+                                                .background(selectedContainerColor)
                                                 .padding(horizontal = 8.dp, vertical = 2.dp)
                                         ) {
                                             Text(
-                                                text = if (isProcessing) "RENDERING VIDEO" else "COMPLETED",
-                                                color = Color(0xFF1D192B),
+                                                text = "RENDERING VIDEO QUEUE",
+                                                color = selectedContentColor,
                                                 fontWeight = FontWeight.Bold,
                                                 fontSize = 9.sp,
                                                 letterSpacing = 0.5.sp
@@ -835,7 +1185,7 @@ fun MainScreen() {
 
                                 // Linear detailed bar
                                 val animatedProgress by animateFloatAsState(
-                                    targetValue = progressValue / 100f,
+                                    targetValue = progressPct / 100f,
                                     animationSpec = ProgressIndicatorDefaults.ProgressAnimationSpec
                                 )
                                 LinearProgressIndicator(
@@ -844,8 +1194,8 @@ fun MainScreen() {
                                         .fillMaxWidth()
                                         .height(6.dp)
                                         .clip(CircleShape),
-                                    color = Color(0xFF6750A4),
-                                    trackColor = Color(0xFFE6E1E5)
+                                    color = MaterialTheme.colorScheme.primary,
+                                    trackColor = MaterialTheme.colorScheme.surfaceVariant
                                 )
 
                                 Spacer(modifier = Modifier.height(8.dp))
@@ -855,15 +1205,15 @@ fun MainScreen() {
                                     horizontalArrangement = Arrangement.SpaceBetween
                                 ) {
                                     Text(
-                                        text = statusText,
-                                        color = Color(0xFF49454F),
+                                        text = "Processing frame... (${progressPct}%)",
+                                        color = textSecondaryColor,
                                         fontSize = 11.sp,
                                         fontFamily = FontFamily.Monospace,
                                         modifier = Modifier.weight(1f)
                                     )
                                     Text(
-                                        text = if (isProcessing) "Est: converting..." else "Done",
-                                        color = Color(0xFF49454F),
+                                        text = "Est: converting...",
+                                        color = textSecondaryColor,
                                         fontSize = 11.sp,
                                         fontFamily = FontFamily.Monospace
                                     )
@@ -873,30 +1223,13 @@ fun MainScreen() {
                         Spacer(modifier = Modifier.height(16.dp))
                     }
 
-                    // Primary Action Button (Pill shape, modern styling)
+                    // Primary Action Button
                     if (!isProcessing) {
                         Button(
                             onClick = {
-                                val uri = selectedVideoUri
-                                if (uri == null) {
-                                    Toast.makeText(context, "Please select a video first", Toast.LENGTH_SHORT).show()
-                                    return@Button
-                                }
-                                val inputData = workDataOf(
-                                    VideoProcessorWorker.KEY_INPUT_URI to uri.toString(),
-                                    VideoProcessorWorker.KEY_STYLE_MODE to selectedStyleMode
+                                pickerLauncher.launch(
+                                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoOnly)
                                 )
-                                val workRequest = OneTimeWorkRequestBuilder<VideoProcessorWorker>()
-                                    .setInputData(inputData)
-                                    .addTag("video_cartoonize_job")
-                                    .build()
-
-                                workManager.enqueueUniqueWork(
-                                    "video_cartoonize_job",
-                                    ExistingWorkPolicy.REPLACE,
-                                    workRequest
-                                )
-                                renderedVideoUri = uri
                             },
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -905,10 +1238,10 @@ fun MainScreen() {
                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF6750A4)),
                             shape = CircleShape
                         ) {
-                            Icon(imageVector = Icons.Default.PlayArrow, contentDescription = "Start", tint = Color.White)
+                            Icon(imageVector = Icons.Default.Queue, contentDescription = "Select & Add", tint = Color.White)
                             Spacer(modifier = Modifier.width(8.dp))
                             Text(
-                                text = if (selectedStyleMode == "anime") "START ANIME RENDER" else "START CARTOON RENDER",
+                                text = "SELECT VIDEOS & ADD TO QUEUE",
                                 fontWeight = FontWeight.Bold,
                                 color = Color.White,
                                 letterSpacing = 0.5.sp,
@@ -919,6 +1252,9 @@ fun MainScreen() {
                         Button(
                             onClick = {
                                 workManager.cancelUniqueWork("video_cartoonize_job")
+                                if (activeProcessingVideo != null) {
+                                    QueueManager.updateVideoStatus(context, activeProcessingVideo.id, "Failed", errorMessage = "Work was cancelled by user")
+                                }
                             },
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -927,10 +1263,10 @@ fun MainScreen() {
                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFB3261E)),
                             shape = CircleShape
                         ) {
-                            Icon(imageVector = Icons.Default.StopCircle, contentDescription = "Stop", tint = Color.White)
+                            Icon(imageVector = Icons.Default.StopCircle, contentDescription = "Abort", tint = Color.White)
                             Spacer(modifier = Modifier.width(8.dp))
                             Text(
-                                text = "ABORT RENDERING ($progressValue%)",
+                                text = "ABORT CURRENT RENDER",
                                 fontWeight = FontWeight.Bold,
                                 color = Color.White,
                                 letterSpacing = 0.5.sp,
@@ -938,68 +1274,39 @@ fun MainScreen() {
                             )
                         }
                     }
-
-                    // Fail State View
-                    if (isFailed && errorMessage != null) {
-                        Spacer(modifier = Modifier.height(12.dp))
-                        Box(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .background(Color(0xFFFDE8E8), RoundedCornerShape(12.dp))
-                                .border(1.dp, Color(0xFFE53935), RoundedCornerShape(12.dp))
-                                .padding(12.dp)
-                        ) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Icon(
-                                    imageVector = Icons.Default.Cancel,
-                                    contentDescription = "Error",
-                                    tint = Color(0xFFE53935),
-                                    modifier = Modifier.size(20.dp)
-                                )
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text(
-                                    text = "Error: $errorMessage",
-                                    color = Color(0xFFC62828),
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.Medium
-                                )
-                            }
-                        }
-                    }
                 }
             }
 
-            // Step 3: Output Results Section (Vibrant Palette Theme)
-            if (showProgressAndOutput && isSucceeded && outputPath != null) {
-                Spacer(modifier = Modifier.height(16.dp))
-                Card(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .border(
-                            width = 1.dp,
-                            color = Color(0xFFCAC4D0),
-                            shape = RoundedCornerShape(28.dp)
-                        ),
-                    shape = RoundedCornerShape(28.dp),
-                    colors = CardDefaults.cardColors(containerColor = Color(0xFFF3EDF7))
-                ) {
-                    Column(
-                        modifier = Modifier.padding(20.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally
+            Spacer(modifier = Modifier.height(16.dp))
+
+            // Step 3 Card: Video Processing Queue
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .border(
+                        width = 1.dp,
+                        color = cardBorderColor,
+                        shape = RoundedCornerShape(28.dp)
+                    ),
+                shape = RoundedCornerShape(28.dp),
+                colors = CardDefaults.cardColors(containerColor = cardBackground)
+            ) {
+                Column(modifier = Modifier.padding(20.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
                             Icon(
-                                imageVector = Icons.Default.CheckCircle,
-                                contentDescription = "Succeeded icon",
-                                tint = Color(0xFF4CAF50)
+                                imageVector = Icons.Default.Queue,
+                                contentDescription = "Queue Icon",
+                                tint = MaterialTheme.colorScheme.primary
                             )
                             Spacer(modifier = Modifier.width(10.dp))
                             Text(
-                                text = "3. STYLIZED VIDEO READY!",
-                                color = Color(0xFF1D1B20),
+                                text = "VIDEO PROCESSING QUEUE (${videoQueue.size})",
+                                color = textPrimaryColor,
                                 fontWeight = FontWeight.Bold,
                                 fontSize = 14.sp,
                                 fontFamily = FontFamily.Monospace,
@@ -1007,93 +1314,694 @@ fun MainScreen() {
                             )
                         }
 
-                        Spacer(modifier = Modifier.height(16.dp))
+                        if (videoQueue.isNotEmpty()) {
+                            IconButton(
+                                onClick = {
+                                    workManager.cancelUniqueWork("video_cartoonize_job")
+                                    QueueManager.clearQueue(context)
+                                }
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Delete,
+                                    contentDescription = "Clear Queue",
+                                    tint = MaterialTheme.colorScheme.error
+                                )
+                            }
+                        }
+                    }
 
-                        // Video Preview Player in nice rounded box
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    if (videoQueue.isEmpty()) {
                         Box(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .height(220.dp)
-                                .clip(RoundedCornerShape(24.dp))
-                                .background(Color.Black)
-                                .border(1.dp, Color(0xFFCAC4D0), RoundedCornerShape(24.dp))
+                                .height(100.dp)
+                                .background(cardBackground, RoundedCornerShape(16.dp))
+                                .border(1.dp, cardBorderColor, RoundedCornerShape(16.dp)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Icon(
+                                    imageVector = Icons.Default.Movie,
+                                    contentDescription = "Empty Queue",
+                                    tint = textSecondaryColor,
+                                    modifier = Modifier.size(28.dp)
+                                )
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    text = "Your processing queue is empty.",
+                                    color = textSecondaryColor,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Medium
+                                )
+                            }
+                        }
+                    } else {
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            videoQueue.forEach { video ->
+                                val statusBgColor = when (video.status) {
+                                    "Processing" -> if (isDarkTheme) Color(0xFF2D1F4E) else Color(0xFFF3EDF7)
+                                    "Completed" -> if (isDarkTheme) Color(0xFF1B3B2B) else Color(0xFFE8F5E9)
+                                    "Failed" -> if (isDarkTheme) Color(0xFF3F1F1F) else Color(0xFFFDE8E8)
+                                    else -> if (isDarkTheme) Color(0xFF2C2C2C) else Color(0xFFF5F5F5)
+                                }
+                                val statusBorderColor = when (video.status) {
+                                    "Processing" -> if (isDarkTheme) Color(0xFFD0BCFF) else Color(0xFF6750A4)
+                                    "Completed" -> if (isDarkTheme) Color(0xFF81C784) else Color(0xFF4CAF50)
+                                    "Failed" -> if (isDarkTheme) Color(0xFFE57373) else Color(0xFFE53935)
+                                    else -> cardBorderColor
+                                }
+                                val statusTextColor = when (video.status) {
+                                    "Processing" -> if (isDarkTheme) Color(0xFFD0BCFF) else Color(0xFF6750A4)
+                                    "Completed" -> if (isDarkTheme) Color(0xFF81C784) else Color(0xFF4CAF50)
+                                    "Failed" -> if (isDarkTheme) Color(0xFFE57373) else Color(0xFFE53935)
+                                    else -> textSecondaryColor
+                                }
+                                val greenActionColor = if (isDarkTheme) Color(0xFF81C784) else Color(0xFF4CAF50)
+
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .background(statusBgColor, RoundedCornerShape(16.dp))
+                                        .border(1.dp, statusBorderColor, RoundedCornerShape(16.dp))
+                                        .padding(12.dp)
+                                ) {
+                                    Column {
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Text(
+                                                    text = video.name,
+                                                    fontWeight = FontWeight.Bold,
+                                                    fontSize = 13.sp,
+                                                    color = textPrimaryColor,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis
+                                                )
+                                                Spacer(modifier = Modifier.height(2.dp))
+                                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                                    Box(
+                                                        modifier = Modifier
+                                                            .clip(CircleShape)
+                                                            .background(selectedContainerColor)
+                                                            .padding(horizontal = 6.dp, vertical = 2.dp)
+                                                    ) {
+                                                        Text(
+                                                            text = video.styleMode.uppercase(),
+                                                            fontSize = 8.sp,
+                                                            fontWeight = FontWeight.Bold,
+                                                            color = selectedContentColor
+                                                        )
+                                                    }
+                                                    Spacer(modifier = Modifier.width(6.dp))
+                                                    Box(
+                                                        modifier = Modifier
+                                                            .clip(CircleShape)
+                                                            .background(if (isDarkTheme) Color(0xFF00363A) else Color(0xFFE0F7FA))
+                                                            .padding(horizontal = 6.dp, vertical = 2.dp)
+                                                    ) {
+                                                        Text(
+                                                            text = "${video.targetResolution} @ ${video.targetFps}FPS",
+                                                            fontSize = 8.sp,
+                                                            fontWeight = FontWeight.Bold,
+                                                            color = if (isDarkTheme) Color(0xFF80DEEA) else Color(0xFF006064)
+                                                        )
+                                                    }
+                                                    Spacer(modifier = Modifier.width(6.dp))
+                                                    Text(
+                                                        text = video.size,
+                                                        fontSize = 10.sp,
+                                                        color = textSecondaryColor
+                                                    )
+                                                }
+                                            }
+
+                                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                                Text(
+                                                    text = when (video.status) {
+                                                        "Processing" -> "Processing (${video.progress}%)"
+                                                        "Completed" -> "Completed"
+                                                        "Failed" -> "Failed"
+                                                        else -> "Pending"
+                                                    },
+                                                    fontWeight = FontWeight.Bold,
+                                                    fontSize = 11.sp,
+                                                    color = statusTextColor,
+                                                    modifier = Modifier.padding(end = 8.dp)
+                                                )
+
+                                                if (video.status == "Completed") {
+                                                    var isSavingItem by remember { mutableStateOf(false) }
+
+                                                    IconButton(
+                                                        onClick = {
+                                                            isSavingItem = true
+                                                            coroutineScope.launch(Dispatchers.IO) {
+                                                                val videoFile = File(video.outputPath ?: "")
+                                                                val savedUri = saveVideoToGallery(
+                                                                    context = context,
+                                                                    videoFile = videoFile,
+                                                                    displayName = "Cartoonized_${System.currentTimeMillis()}.mp4"
+                                                                )
+                                                                withContext(Dispatchers.Main) {
+                                                                    isSavingItem = false
+                                                                    if (savedUri != null) {
+                                                                        Toast.makeText(
+                                                                            context,
+                                                                            "Saved to Gallery!",
+                                                                            Toast.LENGTH_SHORT
+                                                                        ).show()
+                                                                    } else {
+                                                                        Toast.makeText(
+                                                                            context,
+                                                                            "Failed to save.",
+                                                                            Toast.LENGTH_SHORT
+                                                                        ).show()
+                                                                    }
+                                                                }
+                                                            }
+                                                        },
+                                                        enabled = !isSavingItem && video.outputPath != null,
+                                                        modifier = Modifier.size(32.dp)
+                                                    ) {
+                                                        if (isSavingItem) {
+                                                            CircularProgressIndicator(
+                                                                modifier = Modifier.size(16.dp),
+                                                                strokeWidth = 2.dp,
+                                                                color = greenActionColor
+                                                            )
+                                                        } else {
+                                                            Icon(
+                                                                imageVector = Icons.Default.Download,
+                                                                contentDescription = "Save to Gallery",
+                                                                tint = greenActionColor
+                                                            )
+                                                        }
+                                                    }
+
+                                                    IconButton(
+                                                        onClick = { activeComparisonVideo = video },
+                                                        modifier = Modifier.size(32.dp)
+                                                    ) {
+                                                        Icon(
+                                                            imageVector = Icons.Default.PlayArrow,
+                                                            contentDescription = "Play Comparison",
+                                                            tint = greenActionColor
+                                                        )
+                                                    }
+                                                }
+
+                                                IconButton(
+                                                    onClick = {
+                                                        if (video.status == "Processing") {
+                                                            workManager.cancelUniqueWork("video_cartoonize_job")
+                                                        }
+                                                        QueueManager.removeVideo(context, video.id)
+                                                    },
+                                                    modifier = Modifier.size(32.dp)
+                                                ) {
+                                                    Icon(
+                                                        imageVector = Icons.Default.Cancel,
+                                                        contentDescription = "Remove Item",
+                                                        tint = textSecondaryColor
+                                                    )
+                                                }
+                                            }
+                                        }
+
+                                        // Progress bar or error message
+                                        if (video.status == "Processing") {
+                                            Spacer(modifier = Modifier.height(8.dp))
+                                            LinearProgressIndicator(
+                                                progress = { video.progress / 100f },
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .height(4.dp)
+                                                    .clip(CircleShape),
+                                                color = MaterialTheme.colorScheme.primary,
+                                                trackColor = MaterialTheme.colorScheme.surfaceVariant
+                                            )
+                                        } else if (video.status == "Failed" && video.errorMessage != null) {
+                                            Spacer(modifier = Modifier.height(4.dp))
+                                            Text(
+                                                text = "Error: ${video.errorMessage}",
+                                                color = MaterialTheme.colorScheme.error,
+                                                fontSize = 10.sp,
+                                                fontWeight = FontWeight.Medium
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Interactive Comparison Video Player Dialog
+            if (activeComparisonVideo != null) {
+                AlertDialog(
+                    onDismissRequest = { activeComparisonVideo = null },
+                    title = {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = activeComparisonVideo!!.name,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 16.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f)
+                            )
+                            IconButton(onClick = { activeComparisonVideo = null }) {
+                                Icon(imageVector = Icons.Default.Close, contentDescription = "Close Dialog")
+                            }
+                        }
+                    },
+                    text = {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(400.dp)
+                        ) {
+                            VideoComparisonPlayer(
+                                originalUri = Uri.parse(activeComparisonVideo!!.originalUri),
+                                stylizedPath = activeComparisonVideo!!.outputPath ?: "",
+                                styleMode = activeComparisonVideo!!.styleMode,
+                                modifier = Modifier.fillMaxSize()
+                            )
+                        }
+                    },
+                    confirmButton = {},
+                    dismissButton = {}
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun VideoComparisonPlayer(
+    originalUri: Uri,
+    stylizedPath: String,
+    styleMode: String,
+    modifier: Modifier = Modifier
+) {
+    var previewLayout by remember { mutableStateOf("stacked") } // "stacked", "side_by_side", "stylized", "original"
+    var isPlaying by remember { mutableStateOf(true) }
+    var isMuted by remember { mutableStateOf(true) }
+
+    // Store references to VideoViews and MediaPlayers for sync control
+    var originalVideoView by remember { mutableStateOf<VideoView?>(null) }
+    var stylizedVideoView by remember { mutableStateOf<VideoView?>(null) }
+    var originalMediaPlayer by remember { mutableStateOf<android.media.MediaPlayer?>(null) }
+    var stylizedMediaPlayer by remember { mutableStateOf<android.media.MediaPlayer?>(null) }
+
+    // Synchronize play/pause
+    LaunchedEffect(isPlaying) {
+        if (isPlaying) {
+            originalVideoView?.start()
+            stylizedVideoView?.start()
+        } else {
+            originalVideoView?.pause()
+            stylizedVideoView?.pause()
+        }
+    }
+
+    // Synchronize mute/unmute
+    LaunchedEffect(isMuted) {
+        stylizedMediaPlayer?.setVolume(if (isMuted) 0f else 1f, if (isMuted) 0f else 1f)
+    }
+
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .background(Color(0xFF211F26), RoundedCornerShape(24.dp))
+            .border(1.dp, Color(0xFF49454F), RoundedCornerShape(24.dp))
+            .padding(12.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        // Mode Selector Row (Tabs)
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(bottom = 12.dp)
+                .background(Color(0xFF1C1B1F), RoundedCornerShape(16.dp))
+                .padding(4.dp),
+            horizontalArrangement = Arrangement.SpaceEvenly,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            val modes = listOf(
+                "stacked" to "Stacked",
+                "side_by_side" to "Side-by-Side",
+                "stylized" to "AI Output",
+                "original" to "Original"
+            )
+            modes.forEach { (mode, label) ->
+                val selected = previewLayout == mode
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(if (selected) Color(0xFF4F378B) else Color.Transparent)
+                        .clickable { previewLayout = mode }
+                        .padding(vertical = 8.dp, horizontal = 4.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = label,
+                        color = if (selected) Color.White else Color(0xFFCAC4D0),
+                        fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                        fontSize = 11.sp,
+                        maxLines = 1
+                    )
+                }
+            }
+        }
+
+        // Players Area
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(280.dp)
+                .clip(RoundedCornerShape(16.dp))
+                .background(Color.Black),
+            contentAlignment = Alignment.Center
+        ) {
+            when (previewLayout) {
+                "stacked" -> {
+                    Column(modifier = Modifier.fillMaxSize()) {
+                        // Top (Stylized Output)
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxWidth()
                         ) {
                             AndroidView(
                                 factory = { ctx ->
                                     VideoView(ctx).apply {
-                                        setVideoPath(outputPath)
-                                        setOnPreparedListener { mediaPlayer ->
-                                            mediaPlayer.isLooping = true
-                                            start()
+                                        setVideoPath(stylizedPath)
+                                        setOnPreparedListener { mp ->
+                                            mp.isLooping = true
+                                            stylizedMediaPlayer = mp
+                                            mp.setVolume(if (isMuted) 0f else 1f, if (isMuted) 0f else 1f)
+                                            if (isPlaying) start()
                                         }
+                                        stylizedVideoView = this
                                     }
                                 },
                                 modifier = Modifier.fillMaxSize()
                             )
+                            // Tag
+                            Box(
+                                modifier = Modifier
+                                    .align(Alignment.TopStart)
+                                    .padding(8.dp)
+                                    .background(Color.Black.copy(alpha = 0.6f), RoundedCornerShape(4.dp))
+                                    .padding(horizontal = 6.dp, vertical = 2.dp)
+                            ) {
+                                Text(
+                                    text = "STYLIZED (${styleMode.uppercase()})",
+                                    color = Color(0xFFD0BCFF),
+                                    fontSize = 9.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
                         }
 
-                        Spacer(modifier = Modifier.height(16.dp))
-
-                        var isSaving by remember { mutableStateOf(false) }
-
-                        Button(
-                            onClick = {
-                                isSaving = true
-                                coroutineScope.launch(Dispatchers.IO) {
-                                    val videoFile = File(outputPath)
-                                    val savedUri = saveVideoToGallery(
-                                        context = context,
-                                        videoFile = videoFile,
-                                        displayName = "Cartoonized_${System.currentTimeMillis()}.mp4"
-                                    )
-                                    withContext(Dispatchers.Main) {
-                                        isSaving = false
-                                        if (savedUri != null) {
-                                            Toast.makeText(
-                                                context,
-                                                "Successfully saved to Movies/VideoCartoonizer!",
-                                                Toast.LENGTH_LONG
-                                            ).show()
-                                        } else {
-                                            Toast.makeText(
-                                                context,
-                                                "Failed to save video to gallery.",
-                                                Toast.LENGTH_SHORT
-                                            ).show()
-                                        }
-                                    }
-                                }
-                            },
-                            enabled = !isSaving,
+                        // Bottom border separator divider line
+                        Spacer(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .height(56.dp)
-                                .testTag("save_gallery_button"),
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF6750A4)),
-                            shape = CircleShape
+                                .height(1.dp)
+                                .background(Color(0xFF49454F))
+                        )
+
+                        // Bottom (Original Input)
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxWidth()
                         ) {
-                            if (isSaving) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(24.dp),
-                                    color = Color.White
-                                )
-                            } else {
-                                Icon(
-                                    imageVector = Icons.Default.Download,
-                                    contentDescription = "Save icon",
-                                    tint = Color.White
-                                )
-                                Spacer(modifier = Modifier.width(8.dp))
+                            AndroidView(
+                                factory = { ctx ->
+                                    VideoView(ctx).apply {
+                                        setVideoURI(originalUri)
+                                        setOnPreparedListener { mp ->
+                                            mp.isLooping = true
+                                            originalMediaPlayer = mp
+                                            mp.setVolume(0f, 0f)
+                                            if (isPlaying) start()
+                                        }
+                                        originalVideoView = this
+                                    }
+                                },
+                                modifier = Modifier.fillMaxSize()
+                            )
+                            // Tag
+                            Box(
+                                modifier = Modifier
+                                    .align(Alignment.TopStart)
+                                    .padding(8.dp)
+                                    .background(Color.Black.copy(alpha = 0.6f), RoundedCornerShape(4.dp))
+                                    .padding(horizontal = 6.dp, vertical = 2.dp)
+                            ) {
                                 Text(
-                                    text = "SAVE TO DEVICE GALLERY",
-                                    fontWeight = FontWeight.Bold,
+                                    text = "ORIGINAL SOURCE",
                                     color = Color.White,
-                                    fontSize = 14.sp
+                                    fontSize = 9.sp,
+                                    fontWeight = FontWeight.Bold
                                 )
                             }
                         }
                     }
                 }
+                "side_by_side" -> {
+                    Row(modifier = Modifier.fillMaxSize()) {
+                        // Left (Original)
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxHeight()
+                        ) {
+                            AndroidView(
+                                factory = { ctx ->
+                                    VideoView(ctx).apply {
+                                        setVideoURI(originalUri)
+                                        setOnPreparedListener { mp ->
+                                            mp.isLooping = true
+                                            originalMediaPlayer = mp
+                                            mp.setVolume(0f, 0f)
+                                            if (isPlaying) start()
+                                        }
+                                        originalVideoView = this
+                                    }
+                                },
+                                modifier = Modifier.fillMaxSize()
+                            )
+                            // Tag
+                            Box(
+                                modifier = Modifier
+                                    .align(Alignment.TopStart)
+                                    .padding(8.dp)
+                                    .background(Color.Black.copy(alpha = 0.6f), RoundedCornerShape(4.dp))
+                                    .padding(horizontal = 6.dp, vertical = 2.dp)
+                            ) {
+                                Text(
+                                    text = "ORIGINAL",
+                                    color = Color.White,
+                                    fontSize = 9.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
+
+                        // Right border separator vertical divider line
+                        Spacer(
+                            modifier = Modifier
+                                .fillMaxHeight()
+                                .width(1.dp)
+                                .background(Color(0xFF49454F))
+                        )
+
+                        // Right (Stylized)
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxHeight()
+                        ) {
+                            AndroidView(
+                                factory = { ctx ->
+                                    VideoView(ctx).apply {
+                                        setVideoPath(stylizedPath)
+                                        setOnPreparedListener { mp ->
+                                            mp.isLooping = true
+                                            stylizedMediaPlayer = mp
+                                            mp.setVolume(if (isMuted) 0f else 1f, if (isMuted) 0f else 1f)
+                                            if (isPlaying) start()
+                                        }
+                                        stylizedVideoView = this
+                                    }
+                                },
+                                modifier = Modifier.fillMaxSize()
+                            )
+                            // Tag
+                            Box(
+                                modifier = Modifier
+                                    .align(Alignment.TopStart)
+                                    .padding(8.dp)
+                                    .background(Color.Black.copy(alpha = 0.6f), RoundedCornerShape(4.dp))
+                                    .padding(horizontal = 6.dp, vertical = 2.dp)
+                            ) {
+                                Text(
+                                    text = styleMode.uppercase(),
+                                    color = Color(0xFFD0BCFF),
+                                    fontSize = 9.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
+                    }
+                }
+                "stylized" -> {
+                    Box(modifier = Modifier.fillMaxSize()) {
+                        AndroidView(
+                            factory = { ctx ->
+                                VideoView(ctx).apply {
+                                    setVideoPath(stylizedPath)
+                                    setOnPreparedListener { mp ->
+                                        mp.isLooping = true
+                                        stylizedMediaPlayer = mp
+                                        mp.setVolume(if (isMuted) 0f else 1f, if (isMuted) 0f else 1f)
+                                        if (isPlaying) start()
+                                    }
+                                    stylizedVideoView = this
+                                }
+                            },
+                            modifier = Modifier.fillMaxSize()
+                        )
+                        // Tag
+                        Box(
+                            modifier = Modifier
+                                .align(Alignment.TopStart)
+                                .padding(8.dp)
+                                .background(Color.Black.copy(alpha = 0.6f), RoundedCornerShape(4.dp))
+                                .padding(horizontal = 6.dp, vertical = 2.dp)
+                        ) {
+                            Text(
+                                text = "STYLIZED OUTPUT (${styleMode.uppercase()})",
+                                color = Color(0xFFD0BCFF),
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+                }
+                "original" -> {
+                    Box(modifier = Modifier.fillMaxSize()) {
+                        AndroidView(
+                            factory = { ctx ->
+                                VideoView(ctx).apply {
+                                    setVideoURI(originalUri)
+                                    setOnPreparedListener { mp ->
+                                        mp.isLooping = true
+                                        originalMediaPlayer = mp
+                                        mp.setVolume(if (isMuted) 0f else 1f, if (isMuted) 0f else 1f)
+                                        if (isPlaying) start()
+                                    }
+                                    originalVideoView = this
+                                }
+                            },
+                            modifier = Modifier.fillMaxSize()
+                        )
+                        // Tag
+                        Box(
+                            modifier = Modifier
+                                .align(Alignment.TopStart)
+                                .padding(8.dp)
+                                .background(Color.Black.copy(alpha = 0.6f), RoundedCornerShape(4.dp))
+                                .padding(horizontal = 6.dp, vertical = 2.dp)
+                        ) {
+                            Text(
+                                text = "ORIGINAL SOURCE",
+                                color = Color.White,
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        // Playback Controller Controls Row
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.Center,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            // Replay Button
+            IconButton(
+                onClick = {
+                    originalVideoView?.seekTo(0)
+                    stylizedVideoView?.seekTo(0)
+                    originalVideoView?.start()
+                    stylizedVideoView?.start()
+                    isPlaying = true
+                },
+                modifier = Modifier
+                    .size(44.dp)
+                    .background(Color(0xFF313033), CircleShape)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Refresh,
+                    contentDescription = "Restart video playback",
+                    tint = Color(0xFFD0BCFF),
+                    modifier = Modifier.size(20.dp)
+                )
+            }
+
+            Spacer(modifier = Modifier.width(16.dp))
+
+            // Play/Pause Button
+            IconButton(
+                onClick = { isPlaying = !isPlaying },
+                modifier = Modifier
+                    .size(54.dp)
+                    .background(Color(0xFF6750A4), CircleShape)
+            ) {
+                Icon(
+                    imageVector = if (isPlaying) Icons.Default.StopCircle else Icons.Default.PlayArrow,
+                    contentDescription = if (isPlaying) "Pause" else "Play",
+                    tint = Color.White,
+                    modifier = Modifier.size(28.dp)
+                )
+            }
+
+            Spacer(modifier = Modifier.width(16.dp))
+
+            // Volume/Mute Button
+            IconButton(
+                onClick = { isMuted = !isMuted },
+                modifier = Modifier
+                    .size(44.dp)
+                    .background(Color(0xFF313033), CircleShape)
+            ) {
+                Icon(
+                    imageVector = if (isMuted) Icons.Default.VolumeOff else Icons.Default.VolumeUp,
+                    contentDescription = if (isMuted) "Unmute" else "Mute",
+                    tint = Color(0xFFD0BCFF),
+                    modifier = Modifier.size(20.dp)
+                )
             }
         }
     }

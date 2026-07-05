@@ -46,16 +46,22 @@ class VideoProcessorWorker(
             workDataOf(KEY_ERROR to "Input Uri is missing")
         )
         val styleMode = inputData.getString(KEY_STYLE_MODE) ?: "cartoon"
+        val queueId = inputData.getString("queue_id")
 
         val inputUri = Uri.parse(inputUriStr)
         val cacheDir = context.cacheDir
         val outputFile = File(cacheDir, "cartoonized_${System.currentTimeMillis()}.mp4")
         val outputPath = outputFile.absolutePath
 
+        if (queueId != null) {
+            QueueManager.updateVideoStatus(context, queueId, "Processing", 0)
+        }
+
         setProgress(workDataOf(
             KEY_PROGRESS to 0,
             KEY_STATUS to "Initializing AI Engine...",
-            KEY_INPUT_URI to inputUriStr
+            KEY_INPUT_URI to inputUriStr,
+            "queue_id" to (queueId ?: "")
         ))
 
         // Step 1: Initialize local TF Lite Model
@@ -108,18 +114,31 @@ class VideoProcessorWorker(
         } catch (e: Exception) {
             Log.e(TAG, "Failed to read video metadata", e)
             retriever.release()
+            if (queueId != null) {
+                QueueManager.updateVideoStatus(context, queueId, "Failed", errorMessage = "Failed to read video metadata: ${e.message}")
+            }
+            triggerNextJobIfNeeded(context)
             return Result.failure(workDataOf(KEY_ERROR to "Failed to read video metadata: ${e.message}"))
         }
 
-        // We process frames at a target square size (e.g., 480x480 or 512x512) for speed and TFLite compatibility.
-        // Let's use 480x480 as it's highly optimized, fits nicely, and is a multiple of 16 (crucial for video encoders).
-        val processWidth = 480
-        val processHeight = 480
-        val fps = 30
+        // We process frames at a target square size (e.g., 360p, 480p, 720p, 1080p) specified in export configuration.
+        val targetResolutionStr = inputData.getString("target_resolution") ?: "480p"
+        val targetFps = inputData.getInt("target_fps", 15)
+
+        val processSize = when (targetResolutionStr) {
+            "360p" -> 360
+            "480p" -> 480
+            "720p" -> 720
+            "1080p" -> 1080
+            else -> 480
+        }
+        val processWidth = processSize
+        val processHeight = processSize
+        val fps = targetFps
         val totalFrames = ((durationMs * fps) / 1000).coerceAtLeast(1L)
         val frameTimeUs = 1000000L / fps
 
-        Log.i(TAG, "Video details: duration=$durationMs ms, size=${originalWidth}x${originalHeight}, rotation=$rotation. Processing $totalFrames frames at ${processWidth}x${processHeight}...")
+        Log.i(TAG, "Video details: duration=$durationMs ms, size=${originalWidth}x${originalHeight}, rotation=$rotation. Processing $totalFrames frames at ${processWidth}x${processHeight} with $fps FPS...")
 
         // Step 3: Setup MediaCodec Video Encoder & MediaMuxer
         var encoder: MediaCodec? = null
@@ -149,10 +168,17 @@ class VideoProcessorWorker(
                 muxer.setOrientationHint(rotation)
             }
 
-            // Setup Video Encoder format
+            // Setup Video Encoder format with dynamically adjusted bitrate based on selected resolution
             val videoFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, processWidth, processHeight)
             videoFormat.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar) // NV12
-            videoFormat.setInteger(MediaFormat.KEY_BIT_RATE, 2500000) // 2.5 Mbps
+            val bitrate = when (processSize) {
+                360 -> 1500000 // 1.5 Mbps
+                480 -> 2500000 // 2.5 Mbps
+                720 -> 5000000 // 5.0 Mbps
+                1080 -> 8000000 // 8.0 Mbps
+                else -> 2500000
+            }
+            videoFormat.setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
             videoFormat.setInteger(MediaFormat.KEY_FRAME_RATE, fps)
             videoFormat.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
 
@@ -160,17 +186,19 @@ class VideoProcessorWorker(
             encoder.configure(videoFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             encoder.start()
 
-            // Pre-allocate input/output data for model
-            val inputBuffer = ByteBuffer.allocateDirect(1 * processWidth * processHeight * 3 * 4).apply {
+            // Pre-allocate input/output data for model (always 480x480 for TFLite compat)
+            val inputBuffer = ByteBuffer.allocateDirect(1 * 480 * 480 * 3 * 4).apply {
                 order(ByteOrder.nativeOrder())
             }
-            val outputBuffer = ByteBuffer.allocateDirect(1 * processWidth * processHeight * 3 * 4).apply {
+            val outputBuffer = ByteBuffer.allocateDirect(1 * 480 * 480 * 3 * 4).apply {
                 order(ByteOrder.nativeOrder())
             }
 
             // Keep track of pixel arrays to minimize heap allocations inside the loop
             val argbArray = IntArray(processWidth * processHeight)
             val nv12Data = ByteArray(processWidth * processHeight * 3 / 2)
+
+            var lastReportedProgress = -1
 
             // Step 4: Core Frame Processing Loop
             for (frameIndex in 0 until totalFrames) {
@@ -179,15 +207,36 @@ class VideoProcessorWorker(
                     break
                 }
 
+                // Explicitly invoke Garbage Collection periodically to reclaim native bitmap memory
+                if (frameIndex % 15L == 0L) {
+                    System.gc()
+                }
+
                 val currentProgress = ((frameIndex * 100) / totalFrames).toInt()
-                setProgress(workDataOf(
-                    KEY_PROGRESS to currentProgress,
-                    KEY_STATUS to "Processing frame ${frameIndex + 1} of $totalFrames (${currentProgress}%)",
-                    KEY_INPUT_URI to inputUriStr
-                ))
+                // Throttle progress updates to avoid overwhelming WorkManager's SQLite database
+                if (currentProgress != lastReportedProgress && (currentProgress % 5 == 0 || frameIndex == 0L || frameIndex == totalFrames - 1L)) {
+                    lastReportedProgress = currentProgress
+                    setProgress(workDataOf(
+                        KEY_PROGRESS to currentProgress,
+                        KEY_STATUS to "Processing frame ${frameIndex + 1} of $totalFrames (${currentProgress}%)",
+                        KEY_INPUT_URI to inputUriStr,
+                        "queue_id" to (queueId ?: "")
+                    ))
+                    if (queueId != null) {
+                        QueueManager.updateVideoStatus(context, queueId, "Processing", currentProgress)
+                    }
+                }
 
                 val timeUs = frameIndex * frameTimeUs
-                val rawBitmap = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                val rawBitmap = if (android.os.Build.VERSION.SDK_INT >= 27) {
+                    try {
+                        retriever.getScaledFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST, processWidth, processHeight)
+                    } catch (e: Throwable) {
+                        retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                    }
+                } else {
+                    retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                }
                 if (rawBitmap == null) {
                     Log.w(TAG, "Could not extract frame at $timeUs us. Skipping.")
                     continue
@@ -203,13 +252,23 @@ class VideoProcessorWorker(
                 if (styleMode == "anime") {
                     styledBitmap = animeizeBitmap(resizedBitmap)
                     resizedBitmap.recycle()
+                } else if (styleMode == "pixar3d" || styleMode == "3d") {
+                    styledBitmap = pixarizeBitmap(resizedBitmap)
+                    resizedBitmap.recycle()
                 } else if (!useLocalFallback && interpreter != null) {
-                    // Real TFLite inference run
+                    // Real TFLite inference run (always 480x480)
                     try {
+                        val tfliteInputBitmap = if (resizedBitmap.width == 480 && resizedBitmap.height == 480) {
+                            resizedBitmap
+                        } else {
+                            Bitmap.createScaledBitmap(resizedBitmap, 480, 480, true)
+                        }
+
                         // Pre-process: Bitmap to normalized float ByteBuffer
                         inputBuffer.rewind()
-                        resizedBitmap.getPixels(argbArray, 0, processWidth, 0, 0, processWidth, processHeight)
-                        for (pixel in argbArray) {
+                        val tfliteArgbArray = IntArray(480 * 480)
+                        tfliteInputBitmap.getPixels(tfliteArgbArray, 0, 480, 0, 0, 480, 480)
+                        for (pixel in tfliteArgbArray) {
                             val r = (pixel shr 16) and 0xFF
                             val g = (pixel shr 8) and 0xFF
                             val b = pixel and 0xFF
@@ -224,7 +283,7 @@ class VideoProcessorWorker(
 
                         // Post-process: float outputs back to stylized Bitmap
                         outputBuffer.rewind()
-                        val resultPixels = IntArray(processWidth * processHeight)
+                        val resultPixels = IntArray(480 * 480)
                         for (i in resultPixels.indices) {
                             // Scale from [-1, 1] back to [0, 255]
                             val r = (((outputBuffer.floatValue) + 1.0f) * 127.5f).toInt().coerceIn(0, 255)
@@ -232,8 +291,18 @@ class VideoProcessorWorker(
                             val b = (((outputBuffer.floatValue) + 1.0f) * 127.5f).toInt().coerceIn(0, 255)
                             resultPixels[i] = 0xFF000000.toInt() or (r shl 16) or (g shl 8) or b
                         }
-                        styledBitmap = Bitmap.createBitmap(resultPixels, processWidth, processHeight, Bitmap.Config.ARGB_8888)
+                        val tfliteOutputBitmap = Bitmap.createBitmap(resultPixels, 480, 480, Bitmap.Config.ARGB_8888)
+                        
+                        if (tfliteInputBitmap != resizedBitmap) {
+                            tfliteInputBitmap.recycle()
+                        }
                         resizedBitmap.recycle()
+
+                        // Scale back to export resolution
+                        styledBitmap = Bitmap.createScaledBitmap(tfliteOutputBitmap, processWidth, processHeight, true)
+                        if (styledBitmap != tfliteOutputBitmap) {
+                            tfliteOutputBitmap.recycle()
+                        }
                     } catch (e: Exception) {
                         Log.e(TAG, "TFLite inference failed on frame $frameIndex. Falling back to local styling.", e)
                         // Fallback to local custom cartoonizer
@@ -270,8 +339,9 @@ class VideoProcessorWorker(
                         )
                         inputQueued = true
                     }
-                    drainEncoder(encoder, muxer, muxerStarted, audioExtractor, sourceAudioTrackIndex) { index, started ->
-                        videoTrackIndex = index
+                    drainEncoder(encoder, muxer, videoTrackIndex, audioTrackIndex, muxerStarted, audioExtractor, sourceAudioTrackIndex) { vIndex, aIndex, started ->
+                        videoTrackIndex = vIndex
+                        audioTrackIndex = aIndex
                         muxerStarted = started
                     }
                 }
@@ -292,16 +362,18 @@ class VideoProcessorWorker(
                         )
                         eosQueued = true
                     }
-                    drainEncoder(encoder, muxer, muxerStarted, audioExtractor, sourceAudioTrackIndex) { index, started ->
-                        videoTrackIndex = index
+                    drainEncoder(encoder, muxer, videoTrackIndex, audioTrackIndex, muxerStarted, audioExtractor, sourceAudioTrackIndex) { vIndex, aIndex, started ->
+                        videoTrackIndex = vIndex
+                        audioTrackIndex = aIndex
                         muxerStarted = started
                     }
                 }
             }
 
             // Flush remaining encoder output buffers
-            drainEncoder(encoder, muxer, muxerStarted, audioExtractor, sourceAudioTrackIndex, forceEnd = true) { index, started ->
-                videoTrackIndex = index
+            drainEncoder(encoder, muxer, videoTrackIndex, audioTrackIndex, muxerStarted, audioExtractor, sourceAudioTrackIndex, forceEnd = true) { vIndex, aIndex, started ->
+                videoTrackIndex = vIndex
+                audioTrackIndex = aIndex
                 muxerStarted = started
             }
 
@@ -344,8 +416,12 @@ class VideoProcessorWorker(
                 }
             }
 
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             Log.e(TAG, "Error inside processing pipeline", e)
+            if (queueId != null) {
+                QueueManager.updateVideoStatus(context, queueId, "Failed", errorMessage = "Pipeline error: ${e.message}")
+            }
+            triggerNextJobIfNeeded(context)
             return Result.failure(workDataOf(KEY_ERROR to "Pipeline error: ${e.message}"))
         } finally {
             // Clean resources
@@ -389,19 +465,51 @@ class VideoProcessorWorker(
             if (outputFile.exists()) {
                 outputFile.delete()
             }
+            if (queueId != null) {
+                QueueManager.updateVideoStatus(context, queueId, "Failed", errorMessage = "Work was cancelled by user")
+            }
+            triggerNextJobIfNeeded(context)
             return Result.failure(workDataOf(KEY_ERROR to "Work was cancelled by user"))
         }
 
         setProgress(workDataOf(
             KEY_PROGRESS to 100,
             KEY_STATUS to "Cartoonization complete!",
-            KEY_INPUT_URI to inputUriStr
+            KEY_INPUT_URI to inputUriStr,
+            "queue_id" to (queueId ?: "")
         ))
+        if (queueId != null) {
+            QueueManager.updateVideoStatus(context, queueId, "Completed", 100, outputPath = outputPath)
+        }
+        triggerNextJobIfNeeded(context)
         Log.i(TAG, "Finished successfully. Output file saved at: $outputPath")
         return Result.success(workDataOf(
             KEY_OUTPUT_PATH to outputPath,
-            KEY_INPUT_URI to inputUriStr
+            KEY_INPUT_URI to inputUriStr,
+            "queue_id" to (queueId ?: "")
         ))
+    }
+
+    private fun triggerNextJobIfNeeded(context: Context) {
+        val nextPending = QueueManager.getQueue(context).firstOrNull { it.status == "Pending" }
+        if (nextPending != null) {
+            val workManager = androidx.work.WorkManager.getInstance(context)
+            val inputData = androidx.work.workDataOf(
+                VideoProcessorWorker.KEY_INPUT_URI to nextPending.originalUri,
+                VideoProcessorWorker.KEY_STYLE_MODE to nextPending.styleMode,
+                "queue_id" to nextPending.id
+            )
+            val workRequest = androidx.work.OneTimeWorkRequestBuilder<VideoProcessorWorker>()
+                .setInputData(inputData)
+                .addTag("video_cartoonize_job")
+                .build()
+            workManager.enqueueUniqueWork(
+                "video_cartoonize_job",
+                androidx.work.ExistingWorkPolicy.REPLACE,
+                workRequest
+            )
+            QueueManager.updateVideoStatus(context, nextPending.id, "Processing", 0)
+        }
     }
 
     private fun loadModelFile(context: Context, modelPath: String): MappedByteBuffer {
@@ -571,23 +679,226 @@ class VideoProcessorWorker(
         return Bitmap.createBitmap(outPixels, width, height, Bitmap.Config.ARGB_8888)
     }
 
+    private fun pixarizeBitmap(src: Bitmap): Bitmap {
+        val width = src.width
+        val height = src.height
+        val pixels = IntArray(width * height)
+        src.getPixels(pixels, 0, width, 0, 0, width, height)
+        val outPixels = IntArray(width * height)
+
+        // Precompute luma for faster variance calculation
+        val luma = FloatArray(width * height)
+        for (i in pixels.indices) {
+            val c = pixels[i]
+            val r = (c shr 16) and 0xFF
+            val g = (c shr 8) and 0xFF
+            val b = c and 0xFF
+            luma[i] = 0.299f * r + 0.587f * g + 0.114f * b
+        }
+
+        // Apply Kuwahara filter on inner pixels (r=2 to keep boundary safe)
+        for (y in 2 until height - 2) {
+            val offset = y * width
+            for (x in 2 until width - 2) {
+                val idx = offset + x
+
+                // We have 4 subregions of size 3x3:
+                // Subregion 0: Top-Left [y-2..y, x-2..x]
+                // Subregion 1: Top-Right [y-2..y, x..x+2]
+                // Subregion 2: Bottom-Left [y..y+2, x-2..x]
+                // Subregion 3: Bottom-Right [y..y+2, x..x+2]
+
+                var minVar = Float.MAX_VALUE
+                var bestMeanR = 0f
+                var bestMeanG = 0f
+                var bestMeanB = 0f
+
+                // Subregion 0
+                var sumL = 0f
+                var sumL2 = 0f
+                var sumR = 0f
+                var sumG = 0f
+                var sumB = 0f
+                for (dy in -2..0) {
+                    val rowOffset = (y + dy) * width
+                    for (dx in -2..0) {
+                        val pIdx = rowOffset + (x + dx)
+                        val l = luma[pIdx]
+                        sumL += l
+                        sumL2 += l * l
+                        val c = pixels[pIdx]
+                        sumR += ((c shr 16) and 0xFF)
+                        sumG += ((c shr 8) and 0xFF)
+                        sumB += (c and 0xFF)
+                    }
+                }
+                var variance = sumL2 - (sumL * sumL) / 9f
+                if (variance < minVar) {
+                    minVar = variance
+                    bestMeanR = sumR / 9f
+                    bestMeanG = sumG / 9f
+                    bestMeanB = sumB / 9f
+                }
+
+                // Subregion 1
+                sumL = 0f
+                sumL2 = 0f
+                sumR = 0f
+                sumG = 0f
+                sumB = 0f
+                for (dy in -2..0) {
+                    val rowOffset = (y + dy) * width
+                    for (dx in 0..2) {
+                        val pIdx = rowOffset + (x + dx)
+                        val l = luma[pIdx]
+                        sumL += l
+                        sumL2 += l * l
+                        val c = pixels[pIdx]
+                        sumR += ((c shr 16) and 0xFF)
+                        sumG += ((c shr 8) and 0xFF)
+                        sumB += (c and 0xFF)
+                    }
+                }
+                variance = sumL2 - (sumL * sumL) / 9f
+                if (variance < minVar) {
+                    minVar = variance
+                    bestMeanR = sumR / 9f
+                    bestMeanG = sumG / 9f
+                    bestMeanB = sumB / 9f
+                }
+
+                // Subregion 2
+                sumL = 0f
+                sumL2 = 0f
+                sumR = 0f
+                sumG = 0f
+                sumB = 0f
+                for (dy in 0..2) {
+                    val rowOffset = (y + dy) * width
+                    for (dx in -2..0) {
+                        val pIdx = rowOffset + (x + dx)
+                        val l = luma[pIdx]
+                        sumL += l
+                        sumL2 += l * l
+                        val c = pixels[pIdx]
+                        sumR += ((c shr 16) and 0xFF)
+                        sumG += ((c shr 8) and 0xFF)
+                        sumB += (c and 0xFF)
+                    }
+                }
+                variance = sumL2 - (sumL * sumL) / 9f
+                if (variance < minVar) {
+                    minVar = variance
+                    bestMeanR = sumR / 9f
+                    bestMeanG = sumG / 9f
+                    bestMeanB = sumB / 9f
+                }
+
+                // Subregion 3
+                sumL = 0f
+                sumL2 = 0f
+                sumR = 0f
+                sumG = 0f
+                sumB = 0f
+                for (dy in 0..2) {
+                    val rowOffset = (y + dy) * width
+                    for (dx in 0..2) {
+                        val pIdx = rowOffset + (x + dx)
+                        val l = luma[pIdx]
+                        sumL += l
+                        sumL2 += l * l
+                        val c = pixels[pIdx]
+                        sumR += ((c shr 16) and 0xFF)
+                        sumG += ((c shr 8) and 0xFF)
+                        sumB += (c and 0xFF)
+                    }
+                }
+                variance = sumL2 - (sumL * sumL) / 9f
+                if (variance < minVar) {
+                    minVar = variance
+                    bestMeanR = sumR / 9f
+                    bestMeanG = sumG / 9f
+                    bestMeanB = sumB / 9f
+                }
+
+                // Apply Pixar styling to selected mean color
+                val hsv = FloatArray(3)
+                android.graphics.Color.RGBToHSV(bestMeanR.toInt(), bestMeanG.toInt(), bestMeanB.toInt(), hsv)
+                
+                // Saturation boost for Pixar animation palette
+                hsv[1] = (hsv[1] * 1.35f).coerceAtMost(1.0f)
+                
+                // Warm glow illumination: make midtones slightly brighter & warmer
+                if (hsv[0] in 30f..70f) {
+                    hsv[0] = hsv[0] - 5f // shift yellow towards warm orange
+                }
+                hsv[2] = (hsv[2] * 1.15f).coerceAtMost(1.0f)
+
+                val styledColor = android.graphics.Color.HSVToColor(hsv)
+                var fr = (styledColor shr 16) and 0xFF
+                var fg = (styledColor shr 8) and 0xFF
+                var fb = styledColor and 0xFF
+
+                // Shiny highlights (for glossy 3D clay look, eyes, lips)
+                val br = 0.299f * fr + 0.587f * fg + 0.114f * fb
+                if (br > 180f) {
+                    // Glossy specular highlight amplification
+                    fr = (fr * 1.2f).toInt().coerceAtMost(255)
+                    fg = (fg * 1.15f).toInt().coerceAtMost(255)
+                    fb = (fb * 1.3f).toInt().coerceAtMost(255) // boost blue highlights slightly for cool studio lighting
+                } else if (br < 50f) {
+                    // Enrich deep tones with a touch of cinematic navy/violet shadow instead of flat black
+                    fr = (fr * 0.9f + 5).toInt().coerceIn(0, 255)
+                    fg = (fg * 0.9f).toInt().coerceIn(0, 255)
+                    fb = (fb * 0.95f + 12).toInt().coerceIn(0, 255)
+                }
+
+                outPixels[idx] = 0xFF000000.toInt() or (fr shl 16) or (fg shl 8) or fb
+            }
+        }
+
+        // Fill borders gracefully (first 2 and last 2 rows/cols)
+        for (y in 0 until height) {
+            val offset = y * width
+            for (x in 0 until width) {
+                if (x < 2 || x >= width - 2 || y < 2 || y >= height - 2) {
+                    outPixels[offset + x] = pixels[offset + x]
+                }
+            }
+        }
+
+        return Bitmap.createBitmap(outPixels, width, height, Bitmap.Config.ARGB_8888)
+    }
+
     private fun drainEncoder(
         encoder: MediaCodec,
         muxer: MediaMuxer,
+        videoTrackIndex: Int,
+        audioTrackIndex: Int,
         muxerStarted: Boolean,
         audioExtractor: MediaExtractor,
         sourceAudioTrackIndex: Int,
         forceEnd: Boolean = false,
-        onMuxerConfigured: (Int, Boolean) -> Unit
+        onMuxerConfigured: (Int, Int, Boolean) -> Unit
     ) {
         var localMuxerStarted = muxerStarted
-        var localVideoTrackIndex = -1
+        var localVideoTrackIndex = videoTrackIndex
+        var localAudioTrackIndex = audioTrackIndex
         val bufferInfo = MediaCodec.BufferInfo()
+        var tryAgainCount = 0
 
         while (true) {
             val outputBufferIndex = encoder.dequeueOutputBuffer(bufferInfo, 10000)
             if (outputBufferIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
-                if (!forceEnd) break
+                if (!forceEnd) {
+                    break
+                } else {
+                    tryAgainCount++
+                    if (tryAgainCount > 20) {
+                        Log.w(TAG, "Force drain timed out waiting for EOS.")
+                        break
+                    }
+                }
             } else if (outputBufferIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                 if (localMuxerStarted) {
                     throw RuntimeException("Format changed after muxer already started")
@@ -596,11 +907,9 @@ class VideoProcessorWorker(
                 localVideoTrackIndex = muxer.addTrack(newFormat)
                 
                 // Also add Audio track if present in source video
-                var localAudioTrackIndex = -1
                 if (sourceAudioTrackIndex >= 0) {
                     try {
                         val audioFormat = audioExtractor.getTrackFormat(sourceAudioTrackIndex)
-                        // Add to output muxer
                         localAudioTrackIndex = muxer.addTrack(audioFormat)
                     } catch (e: Exception) {
                         Log.e(TAG, "Error adding audio track to format", e)
@@ -609,8 +918,9 @@ class VideoProcessorWorker(
                 
                 muxer.start()
                 localMuxerStarted = true
-                onMuxerConfigured(localVideoTrackIndex, localMuxerStarted)
+                onMuxerConfigured(localVideoTrackIndex, localAudioTrackIndex, localMuxerStarted)
             } else if (outputBufferIndex >= 0) {
+                tryAgainCount = 0
                 val encodedData = encoder.getOutputBuffer(outputBufferIndex)!!
                 if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
                     bufferInfo.size = 0
@@ -619,7 +929,8 @@ class VideoProcessorWorker(
                 if (bufferInfo.size > 0 && localMuxerStarted) {
                     encodedData.position(bufferInfo.offset)
                     encodedData.limit(bufferInfo.offset + bufferInfo.size)
-                    muxer.writeSampleData(localVideoTrackIndex.coerceAtLeast(0), encodedData, bufferInfo)
+                    val targetTrack = if (localVideoTrackIndex >= 0) localVideoTrackIndex else 0
+                    muxer.writeSampleData(targetTrack, encodedData, bufferInfo)
                 }
 
                 encoder.releaseOutputBuffer(outputBufferIndex, false)
