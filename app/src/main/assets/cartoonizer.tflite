@@ -1,0 +1,3 @@
+// Placeholder for Offline TFLite Cartoon Style Transfer Model.
+// Real model can be loaded or updated here. The application also contains
+// a fully-integrated local high-performance Cartoon Filter Fallback.

@@ -1,0 +1,6 @@
+{
+  "name": "Video Cartoonizer",
+  "description": "Completely offline on-device AI video cartoon stylization using TensorFlow Lite, GPU acceleration, and WorkManager.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
