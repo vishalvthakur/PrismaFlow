@@ -38,6 +38,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -56,6 +57,7 @@ import androidx.compose.material.icons.filled.SmartDisplay
 import androidx.compose.material.icons.filled.StopCircle
 import androidx.compose.material.icons.filled.VideoLibrary
 import androidx.compose.material3.Button
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -126,29 +128,73 @@ fun MainScreen() {
     var selectedVideoName by remember { mutableStateOf("No video selected") }
     var selectedVideoSize by remember { mutableStateOf("") }
     var selectedStyleMode by remember { mutableStateOf("cartoon") } // "cartoon" or "anime"
+    var isCopyingToCache by remember { mutableStateOf(false) }
+    var renderedVideoUri by remember { mutableStateOf<Uri?>(null) }
 
     // WorkManager status observer
     val workInfos by workManager.getWorkInfosForUniqueWorkFlow("video_cartoonize_job")
         .collectAsState(initial = emptyList())
 
     val activeWorkInfo = workInfos.firstOrNull()
-    val isProcessing = activeWorkInfo?.state == WorkInfo.State.RUNNING
+    val isProcessing = activeWorkInfo != null && (
+        activeWorkInfo.state == WorkInfo.State.RUNNING ||
+        activeWorkInfo.state == WorkInfo.State.ENQUEUED ||
+        activeWorkInfo.state == WorkInfo.State.BLOCKED
+    )
     val isSucceeded = activeWorkInfo?.state == WorkInfo.State.SUCCEEDED
     val isFailed = activeWorkInfo?.state == WorkInfo.State.FAILED
 
     val progressValue = activeWorkInfo?.progress?.getInt(VideoProcessorWorker.KEY_PROGRESS, 0) ?: 0
-    val statusText = activeWorkInfo?.progress?.getString(VideoProcessorWorker.KEY_STATUS) ?: "Standby"
+    val statusText = if (activeWorkInfo?.state == WorkInfo.State.ENQUEUED) {
+        "Queued for processing..."
+    } else {
+        activeWorkInfo?.progress?.getString(VideoProcessorWorker.KEY_STATUS) ?: "Standby"
+    }
     val outputPath = activeWorkInfo?.outputData?.getString(VideoProcessorWorker.KEY_OUTPUT_PATH)
     val errorMessage = activeWorkInfo?.outputData?.getString(VideoProcessorWorker.KEY_ERROR)
+    val showProgressAndOutput = selectedVideoUri != null && selectedVideoUri == renderedVideoUri
+
+    // Sync renderedVideoUri from activeWorkInfo progress or output to restore state automatically
+    LaunchedEffect(activeWorkInfo) {
+        if (activeWorkInfo != null) {
+            val progressUri = activeWorkInfo.progress.getString(VideoProcessorWorker.KEY_INPUT_URI)
+            val outputUri = activeWorkInfo.outputData.getString(VideoProcessorWorker.KEY_INPUT_URI)
+            val uriStr = progressUri ?: outputUri
+            if (uriStr != null) {
+                val recoveredUri = Uri.parse(uriStr)
+                if (selectedVideoUri == null) {
+                    selectedVideoUri = recoveredUri
+                    renderedVideoUri = recoveredUri
+                    selectedVideoName = "Recovered Video"
+                } else if (renderedVideoUri == null) {
+                    renderedVideoUri = recoveredUri
+                }
+            }
+        }
+    }
 
     // Gallery Video Picker
     val pickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickVisualMedia()
     ) { uri ->
         if (uri != null) {
-            selectedVideoUri = uri
-            selectedVideoName = getFileName(context, uri) ?: "Selected Video"
-            selectedVideoSize = getFileSizeString(context, uri) ?: ""
+            isCopyingToCache = true
+            selectedVideoName = "Importing video..."
+            selectedVideoSize = ""
+            coroutineScope.launch(Dispatchers.IO) {
+                val cachedFile = copyUriToCache(context, uri)
+                withContext(Dispatchers.Main) {
+                    isCopyingToCache = false
+                    if (cachedFile != null) {
+                        selectedVideoUri = Uri.fromFile(cachedFile)
+                        selectedVideoName = getFileName(context, uri) ?: "Selected Video"
+                        selectedVideoSize = getFileSizeString(context, uri) ?: ""
+                    } else {
+                        selectedVideoName = "Failed to load video"
+                        Toast.makeText(context, "Failed to import video. Try another file.", Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
         }
     }
 
@@ -400,7 +446,7 @@ fun MainScreen() {
                             .clip(RoundedCornerShape(16.dp))
                             .background(Color.White)
                             .border(1.dp, Color(0xFFCAC4D0), RoundedCornerShape(16.dp))
-                            .clickable(enabled = !isProcessing) {
+                            .clickable(enabled = !isProcessing && !isCopyingToCache) {
                                 pickerLauncher.launch(
                                     PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoOnly)
                                 )
@@ -408,7 +454,21 @@ fun MainScreen() {
                             .testTag("select_video_card"),
                         contentAlignment = Alignment.Center
                     ) {
-                        if (selectedVideoUri == null) {
+                        if (isCopyingToCache) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(24.dp),
+                                    color = Color(0xFF6750A4)
+                                )
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Text(
+                                    text = "Importing and copying video to safe cache...",
+                                    color = Color(0xFF49454F),
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Medium
+                                )
+                            }
+                        } else if (selectedVideoUri == null) {
                             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                                 Icon(
                                     imageVector = Icons.Default.VideoLibrary,
@@ -462,6 +522,54 @@ fun MainScreen() {
                                 )
                             }
                         }
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    OutlinedButton(
+                        onClick = {
+                            isCopyingToCache = true
+                            selectedVideoName = "Preparing sample video..."
+                            selectedVideoSize = ""
+                            coroutineScope.launch(Dispatchers.IO) {
+                                val cachedFile = copyAssetToCache(context, "sample.mp4")
+                                withContext(Dispatchers.Main) {
+                                    isCopyingToCache = false
+                                    if (cachedFile != null) {
+                                        selectedVideoUri = Uri.fromFile(cachedFile)
+                                        selectedVideoName = "sample.mp4 (Offline Demo)"
+                                        selectedVideoSize = "770 KB"
+                                        Toast.makeText(context, "Offline sample video loaded successfully!", Toast.LENGTH_SHORT).show()
+                                    } else {
+                                        selectedVideoName = "Failed to load sample video"
+                                        Toast.makeText(context, "Failed to load sample video from assets.", Toast.LENGTH_LONG).show()
+                                    }
+                                }
+                            }
+                        },
+                        enabled = !isProcessing && !isCopyingToCache,
+                        shape = CircleShape,
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            contentColor = Color(0xFF6750A4)
+                        ),
+                        border = BorderStroke(1.dp, Color(0xFF6750A4)),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(40.dp)
+                            .testTag("load_sample_video_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.AutoAwesome,
+                            contentDescription = "Sample video",
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "TRY BUNDLED SAMPLE VIDEO",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 11.sp,
+                            letterSpacing = 0.5.sp
+                        )
                     }
                 }
             }
@@ -653,75 +761,116 @@ fun MainScreen() {
 
                     Spacer(modifier = Modifier.height(16.dp))
 
-                    if (isProcessing || progressValue > 0) {
-                        // Detailed Mockup processing panel
-                        Column(modifier = Modifier.fillMaxWidth()) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.Top
-                            ) {
-                                Column {
+                    if (showProgressAndOutput && (isProcessing || progressValue > 0)) {
+                        // Detailed Mockup processing panel styled inside a beautiful nested Card
+                        Card(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 4.dp),
+                            colors = CardDefaults.cardColors(containerColor = Color.White),
+                            shape = RoundedCornerShape(20.dp),
+                            elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+                        ) {
+                            Column(modifier = Modifier.padding(16.dp)) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(16.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    // Custom Circular Progress Ring with Percentage inside
+                                    Box(
+                                        contentAlignment = Alignment.Center,
+                                        modifier = Modifier.size(72.dp)
+                                    ) {
+                                        CircularProgressIndicator(
+                                            progress = { progressValue / 100f },
+                                            modifier = Modifier.fillMaxSize(),
+                                            color = Color(0xFF6750A4),
+                                            strokeWidth = 6.dp,
+                                            trackColor = Color(0xFFE6E1E5)
+                                        )
+                                        Text(
+                                            text = "$progressValue%",
+                                            color = Color(0xFF6750A4),
+                                            fontWeight = FontWeight.ExtraBold,
+                                            fontSize = 14.sp,
+                                            fontFamily = FontFamily.Monospace
+                                        )
+                                    }
+
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = if (selectedStyleMode == "anime") "Vibrant Anime Stylization" else "Classic Cartoon Stylization",
+                                            fontWeight = FontWeight.Bold,
+                                            color = Color(0xFF1D1B20),
+                                            fontSize = 15.sp
+                                        )
+                                        Spacer(modifier = Modifier.height(2.dp))
+                                        Text(
+                                            text = "Engine: AnimeGANv2 TFLite",
+                                            color = Color(0xFF79747E),
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.Medium
+                                        )
+                                        Spacer(modifier = Modifier.height(4.dp))
+                                        // A small pill badge indicating processing state
+                                        Box(
+                                            modifier = Modifier
+                                                .clip(RoundedCornerShape(8.dp))
+                                                .background(Color(0xFFE8DEF8))
+                                                .padding(horizontal = 8.dp, vertical = 2.dp)
+                                        ) {
+                                            Text(
+                                                text = if (isProcessing) "RENDERING VIDEO" else "COMPLETED",
+                                                color = Color(0xFF1D192B),
+                                                fontWeight = FontWeight.Bold,
+                                                fontSize = 9.sp,
+                                                letterSpacing = 0.5.sp
+                                            )
+                                        }
+                                    }
+                                }
+
+                                Spacer(modifier = Modifier.height(16.dp))
+
+                                // Linear detailed bar
+                                val animatedProgress by animateFloatAsState(
+                                    targetValue = progressValue / 100f,
+                                    animationSpec = ProgressIndicatorDefaults.ProgressAnimationSpec
+                                )
+                                LinearProgressIndicator(
+                                    progress = { animatedProgress },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(6.dp)
+                                        .clip(CircleShape),
+                                    color = Color(0xFF6750A4),
+                                    trackColor = Color(0xFFE6E1E5)
+                                )
+
+                                Spacer(modifier = Modifier.height(8.dp))
+
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
                                     Text(
-                                        text = "AnimeGAN_v2_Lite.tflite",
-                                        fontWeight = FontWeight.Medium,
+                                        text = statusText,
                                         color = Color(0xFF49454F),
-                                        fontSize = 13.sp
+                                        fontSize = 11.sp,
+                                        fontFamily = FontFamily.Monospace,
+                                        modifier = Modifier.weight(1f)
                                     )
                                     Text(
-                                        text = "NNAPI & GPU Acceleration",
-                                        color = Color(0xFF79747E),
-                                        fontSize = 11.sp
+                                        text = if (isProcessing) "Est: converting..." else "Done",
+                                        color = Color(0xFF49454F),
+                                        fontSize = 11.sp,
+                                        fontFamily = FontFamily.Monospace
                                     )
                                 }
-                                Text(
-                                    text = "$progressValue%",
-                                    color = Color(0xFF6750A4),
-                                    fontWeight = FontWeight.Bold,
-                                    fontSize = 18.sp,
-                                    fontFamily = FontFamily.Monospace
-                                )
                             }
-
-                            Spacer(modifier = Modifier.height(12.dp))
-
-                            // MD3 Styled Linear Progress Bar
-                            val animatedProgress by animateFloatAsState(
-                                targetValue = progressValue / 100f,
-                                animationSpec = ProgressIndicatorDefaults.ProgressAnimationSpec
-                            )
-                            LinearProgressIndicator(
-                                progress = { animatedProgress },
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(6.dp)
-                                    .clip(CircleShape),
-                                color = Color(0xFF6750A4),
-                                trackColor = Color(0xFFE6E1E5)
-                            )
-
-                            Spacer(modifier = Modifier.height(10.dp))
-
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween
-                            ) {
-                                Text(
-                                    text = "Status: $statusText",
-                                    color = Color(0xFF49454F),
-                                    fontSize = 11.sp,
-                                    fontFamily = FontFamily.Monospace
-                                )
-                                Text(
-                                    text = if (isProcessing) "Est: remaining..." else "Done",
-                                    color = Color(0xFF49454F),
-                                    fontSize = 11.sp,
-                                    fontFamily = FontFamily.Monospace
-                                )
-                            }
-
-                            Spacer(modifier = Modifier.height(16.dp))
                         }
+                        Spacer(modifier = Modifier.height(16.dp))
                     }
 
                     // Primary Action Button (Pill shape, modern styling)
@@ -747,6 +896,7 @@ fun MainScreen() {
                                     ExistingWorkPolicy.REPLACE,
                                     workRequest
                                 )
+                                renderedVideoUri = uri
                             },
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -780,7 +930,7 @@ fun MainScreen() {
                             Icon(imageVector = Icons.Default.StopCircle, contentDescription = "Stop", tint = Color.White)
                             Spacer(modifier = Modifier.width(8.dp))
                             Text(
-                                text = "ABORT RENDERING",
+                                text = "ABORT RENDERING ($progressValue%)",
                                 fontWeight = FontWeight.Bold,
                                 color = Color.White,
                                 letterSpacing = 0.5.sp,
@@ -820,7 +970,7 @@ fun MainScreen() {
             }
 
             // Step 3: Output Results Section (Vibrant Palette Theme)
-            if (isSucceeded && outputPath != null) {
+            if (showProgressAndOutput && isSucceeded && outputPath != null) {
                 Spacer(modifier = Modifier.height(16.dp))
                 Card(
                     modifier = Modifier
@@ -946,6 +1096,36 @@ fun MainScreen() {
                 }
             }
         }
+    }
+}
+
+// Helper: Copy bundled sample asset video to cache folder so it behaves like a file URI
+private fun copyAssetToCache(context: Context, assetName: String): File? {
+    try {
+        val inputStream = context.assets.open(assetName)
+        val tempFile = File(context.cacheDir, "sample_source_${System.currentTimeMillis()}.mp4")
+        tempFile.outputStream().use { outputStream ->
+            inputStream.use { it.copyTo(outputStream) }
+        }
+        return tempFile
+    } catch (e: Exception) {
+        Log.e("MainActivity", "Failed to copy asset to cache", e)
+        return null
+    }
+}
+
+// Helper: Copy selected Uri content to a secure, accessible app cache file
+private fun copyUriToCache(context: Context, uri: Uri): File? {
+    try {
+        val inputStream = context.contentResolver.openInputStream(uri) ?: return null
+        val tempFile = File(context.cacheDir, "temp_source_${System.currentTimeMillis()}.mp4")
+        tempFile.outputStream().use { outputStream ->
+            inputStream.use { it.copyTo(outputStream) }
+        }
+        return tempFile
+    } catch (e: Exception) {
+        Log.e("MainActivity", "Failed to copy URI to cache", e)
+        return null
     }
 }
 

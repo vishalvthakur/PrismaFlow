@@ -52,7 +52,11 @@ class VideoProcessorWorker(
         val outputFile = File(cacheDir, "cartoonized_${System.currentTimeMillis()}.mp4")
         val outputPath = outputFile.absolutePath
 
-        setProgress(workDataOf(KEY_PROGRESS to 0, KEY_STATUS to "Initializing AI Engine..."))
+        setProgress(workDataOf(
+            KEY_PROGRESS to 0,
+            KEY_STATUS to "Initializing AI Engine...",
+            KEY_INPUT_URI to inputUriStr
+        ))
 
         // Step 1: Initialize local TF Lite Model
         var useLocalFallback = true
@@ -65,12 +69,12 @@ class VideoProcessorWorker(
                 gpuDelegate = GpuDelegate()
                 options.addDelegate(gpuDelegate)
                 Log.i(TAG, "TensorFlow Lite GPU delegate initialized successfully.")
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 Log.w(TAG, "GPU delegate failed to initialize. Falling back to NNAPI or CPU.", e)
                 try {
                     options.setUseNNAPI(true)
                     Log.i(TAG, "NNAPI delegate fallback enabled.")
-                } catch (nnapiEx: Exception) {
+                } catch (nnapiEx: Throwable) {
                     Log.w(TAG, "NNAPI delegate failed to initialize. Running on standard CPU.", nnapiEx)
                 }
             }
@@ -83,7 +87,7 @@ class VideoProcessorWorker(
                 useLocalFallback = false
                 Log.i(TAG, "TFLite interpreter loaded successfully. Model will be used for styles.")
             }
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             Log.w(TAG, "Unable to load TFLite model. Falling back to high-performance local stylizer.", e)
             useLocalFallback = true
         }
@@ -178,7 +182,8 @@ class VideoProcessorWorker(
                 val currentProgress = ((frameIndex * 100) / totalFrames).toInt()
                 setProgress(workDataOf(
                     KEY_PROGRESS to currentProgress,
-                    KEY_STATUS to "Processing frame ${frameIndex + 1} of $totalFrames (${currentProgress}%)"
+                    KEY_STATUS to "Processing frame ${frameIndex + 1} of $totalFrames (${currentProgress}%)",
+                    KEY_INPUT_URI to inputUriStr
                 ))
 
                 val timeUs = frameIndex * frameTimeUs
@@ -302,7 +307,11 @@ class VideoProcessorWorker(
 
             // Step 6: Copy Original Audio Track to Output Muxer
             if (!isStopped && muxerStarted && sourceAudioTrackIndex >= 0) {
-                setProgress(workDataOf(KEY_PROGRESS to 95, KEY_STATUS to "Syncing audio track..."))
+                setProgress(workDataOf(
+                    KEY_PROGRESS to 95,
+                    KEY_STATUS to "Syncing audio track...",
+                    KEY_INPUT_URI to inputUriStr
+                ))
                 try {
                     audioExtractor.selectTrack(sourceAudioTrackIndex)
                     val audioFormat = audioExtractor.getTrackFormat(sourceAudioTrackIndex)
@@ -371,7 +380,7 @@ class VideoProcessorWorker(
             try {
                 interpreter?.close()
                 gpuDelegate?.close()
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 Log.w(TAG, "Error closing TFLite interpreter", e)
             }
         }
@@ -383,9 +392,16 @@ class VideoProcessorWorker(
             return Result.failure(workDataOf(KEY_ERROR to "Work was cancelled by user"))
         }
 
-        setProgress(workDataOf(KEY_PROGRESS to 100, KEY_STATUS to "Cartoonization complete!"))
+        setProgress(workDataOf(
+            KEY_PROGRESS to 100,
+            KEY_STATUS to "Cartoonization complete!",
+            KEY_INPUT_URI to inputUriStr
+        ))
         Log.i(TAG, "Finished successfully. Output file saved at: $outputPath")
-        return Result.success(workDataOf(KEY_OUTPUT_PATH to outputPath))
+        return Result.success(workDataOf(
+            KEY_OUTPUT_PATH to outputPath,
+            KEY_INPUT_URI to inputUriStr
+        ))
     }
 
     private fun loadModelFile(context: Context, modelPath: String): MappedByteBuffer {
